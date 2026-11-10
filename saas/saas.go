@@ -5,33 +5,38 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"os"
 	"path"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsConfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/sts/types"
+	"golang.org/x/xerrors"
+
 	"github.com/future-architect/vuls/config"
-	c "github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/logging"
 	"github.com/future-architect/vuls/models"
 	"github.com/future-architect/vuls/util"
-	"golang.org/x/xerrors"
 )
 
 // Writer writes results to SaaS
-type Writer struct{}
+type Writer struct {
+	Cnf     config.SaasConf
+	Proxy   string
+	Timeout time.Duration
+}
 
 // TempCredential : TempCredential
 type TempCredential struct {
-	Credential   *sts.Credentials `json:"Credential"`
-	S3Bucket     string           `json:"S3Bucket"`
-	S3ResultsDir string           `json:"S3ResultsDir"`
+	Credential   *types.Credentials `json:"Credential"`
+	S3Bucket     string             `json:"S3Bucket"`
+	S3ResultsDir string             `json:"S3ResultsDir"`
 }
 
 type payload struct {
@@ -42,21 +47,22 @@ type payload struct {
 	ScannedIPv6s string `json:"ScannedIPv6s"`
 }
 
-// UploadSaas : UploadSaas
+// Write :
 func (w Writer) Write(rs ...models.ScanResult) error {
 	if len(rs) == 0 {
 		return nil
 	}
+	tags := strings.Split(os.Getenv("VULS_TAGS"), ",")
 
 	ipv4s, ipv6s, err := util.IP()
 	if err != nil {
-		util.Log.Errorf("Failed to fetch scannedIPs. err: %+v", err)
+		logging.Log.Warnf("Failed to get scannedIPs. err: %+v", err)
 	}
 	hostname, _ := os.Hostname()
 
 	payload := payload{
-		GroupID:      c.Conf.Saas.GroupID,
-		Token:        c.Conf.Saas.Token,
+		GroupID:      w.Cnf.GroupID,
+		Token:        w.Cnf.Token,
 		ScannedBy:    hostname,
 		ScannedIPv4s: strings.Join(ipv4s, ", "),
 		ScannedIPv6s: strings.Join(ipv6s, ", "),
@@ -66,15 +72,15 @@ func (w Writer) Write(rs ...models.ScanResult) error {
 		return xerrors.Errorf("Failed to Marshal to JSON: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.Conf.Saas.URL, bytes.NewBuffer(body))
+	ctx, cancel := context.WithTimeout(context.Background(), w.Timeout)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, w.Cnf.URL, bytes.NewBuffer(body))
 	defer cancel()
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	client, err := util.GetHTTPClient(config.Conf.HTTPProxy)
+	client, err := util.GetHTTPClient(w.Proxy)
 	if err != nil {
 		return err
 	}
@@ -87,7 +93,7 @@ func (w Writer) Write(rs ...models.ScanResult) error {
 		return xerrors.Errorf("Failed to get Credential. Request JSON : %s,", string(body))
 	}
 
-	t, err := ioutil.ReadAll(resp.Body)
+	t, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return err
 	}
@@ -96,37 +102,44 @@ func (w Writer) Write(rs ...models.ScanResult) error {
 		return xerrors.Errorf("Failed to unmarshal saas credential file. err : %s", err)
 	}
 
-	sess, err := session.NewSession(&aws.Config{
-		Credentials: credentials.NewStaticCredentialsFromCreds(credentials.Value{
-			AccessKeyID:     *tempCredential.Credential.AccessKeyId,
-			SecretAccessKey: *tempCredential.Credential.SecretAccessKey,
-			SessionToken:    *tempCredential.Credential.SessionToken,
-		}),
-		Region: aws.String("ap-northeast-1"),
-	})
+	cfg, err := awsConfig.LoadDefaultConfig(ctx,
+		awsConfig.WithRegion("ap-northeast-1"),
+		awsConfig.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(*tempCredential.Credential.AccessKeyId, *tempCredential.Credential.SecretAccessKey, *tempCredential.Credential.SessionToken)),
+	)
 	if err != nil {
-		return xerrors.Errorf("Failed to new aws session. err: %w", err)
+		return xerrors.Errorf("Failed to load config. err: %w", err)
+	}
+	// For S3 upload of aws sdk
+	if err := os.Setenv("HTTPS_PROXY", w.Proxy); err != nil {
+		return xerrors.Errorf("Failed to set HTTP proxy: %s", err)
 	}
 
-	svc := s3.New(sess)
+	svc := s3.NewFromConfig(cfg)
 	for _, r := range rs {
+		if 0 < len(tags) {
+			if r.Optional == nil {
+				r.Optional = map[string]any{}
+			}
+			r.Optional["VULS_TAGS"] = tags
+		}
+
 		b, err := json.Marshal(r)
 		if err != nil {
 			return xerrors.Errorf("Failed to Marshal to JSON: %w", err)
 		}
-		util.Log.Infof("Uploading... %s", r.FormatServerName())
+		logging.Log.Infof("Uploading... %s", r.FormatServerName())
 		s3Key := renameKeyName(r.ServerUUID, r.Container)
 		putObjectInput := &s3.PutObjectInput{
 			Bucket: aws.String(tempCredential.S3Bucket),
 			Key:    aws.String(path.Join(tempCredential.S3ResultsDir, s3Key)),
 			Body:   bytes.NewReader(b),
 		}
-		if _, err := svc.PutObject(putObjectInput); err != nil {
+		if _, err := svc.PutObject(ctx, putObjectInput); err != nil {
 			return xerrors.Errorf("Failed to upload data to %s/%s, err: %w",
-				tempCredential.S3Bucket, s3Key, err)
+				tempCredential.S3Bucket, path.Join(tempCredential.S3ResultsDir, s3Key), err)
 		}
 	}
-	util.Log.Infof("done")
+	logging.Log.Infof("done")
 	return nil
 }
 

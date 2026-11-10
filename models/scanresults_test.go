@@ -3,635 +3,11 @@ package models
 import (
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/future-architect/vuls/config"
-	"github.com/k0kubun/pp"
+	"github.com/future-architect/vuls/constant"
+	"github.com/future-architect/vuls/cwe"
 )
-
-func TestFilterByCvssOver(t *testing.T) {
-	type in struct {
-		over float64
-		rs   ScanResult
-	}
-	var tests = []struct {
-		in  in
-		out ScanResult
-	}{
-		//0
-		{
-			in: in{
-				over: 7.0,
-				rs: ScanResult{
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-							CveContents: NewCveContents(
-								CveContent{
-									Type:         Nvd,
-									CveID:        "CVE-2017-0001",
-									Cvss2Score:   7.1,
-									LastModified: time.Time{},
-								},
-							),
-						},
-						"CVE-2017-0002": {
-							CveID: "CVE-2017-0002",
-							CveContents: NewCveContents(
-								CveContent{
-									Type:         Nvd,
-									CveID:        "CVE-2017-0002",
-									Cvss2Score:   6.9,
-									LastModified: time.Time{},
-								},
-							),
-						},
-						"CVE-2017-0003": {
-							CveID: "CVE-2017-0003",
-							CveContents: NewCveContents(
-								CveContent{
-									Type:         Nvd,
-									CveID:        "CVE-2017-0003",
-									Cvss2Score:   6.9,
-									LastModified: time.Time{},
-								},
-								CveContent{
-									Type:         Jvn,
-									CveID:        "CVE-2017-0003",
-									Cvss2Score:   7.2,
-									LastModified: time.Time{},
-								},
-							),
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ScannedCves: VulnInfos{
-					"CVE-2017-0001": {
-						CveID: "CVE-2017-0001",
-						CveContents: NewCveContents(
-							CveContent{
-								Type:         Nvd,
-								CveID:        "CVE-2017-0001",
-								Cvss2Score:   7.1,
-								LastModified: time.Time{},
-							},
-						),
-					},
-					"CVE-2017-0003": {
-						CveID: "CVE-2017-0003",
-						CveContents: NewCveContents(
-							CveContent{
-								Type:         Nvd,
-								CveID:        "CVE-2017-0003",
-								Cvss2Score:   6.9,
-								LastModified: time.Time{},
-							},
-							CveContent{
-								Type:         Jvn,
-								CveID:        "CVE-2017-0003",
-								Cvss2Score:   7.2,
-								LastModified: time.Time{},
-							},
-						),
-					},
-				},
-			},
-		},
-		//1 OVAL Severity
-		{
-			in: in{
-				over: 7.0,
-				rs: ScanResult{
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-							CveContents: NewCveContents(
-								CveContent{
-									Type:          Ubuntu,
-									CveID:         "CVE-2017-0001",
-									Cvss3Severity: "HIGH",
-									LastModified:  time.Time{},
-								},
-							),
-						},
-						"CVE-2017-0002": {
-							CveID: "CVE-2017-0002",
-							CveContents: NewCveContents(
-								CveContent{
-									Type:          Debian,
-									CveID:         "CVE-2017-0002",
-									Cvss3Severity: "CRITICAL",
-									LastModified:  time.Time{},
-								},
-							),
-						},
-						"CVE-2017-0003": {
-							CveID: "CVE-2017-0003",
-							CveContents: NewCveContents(
-								CveContent{
-									Type:          GitHub,
-									CveID:         "CVE-2017-0003",
-									Cvss3Severity: "IMPORTANT",
-									LastModified:  time.Time{},
-								},
-							),
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ScannedCves: VulnInfos{
-					"CVE-2017-0001": {
-						CveID: "CVE-2017-0001",
-						CveContents: NewCveContents(
-							CveContent{
-								Type:          Ubuntu,
-								CveID:         "CVE-2017-0001",
-								Cvss3Severity: "HIGH",
-								LastModified:  time.Time{},
-							},
-						),
-					},
-					"CVE-2017-0002": {
-						CveID: "CVE-2017-0002",
-						CveContents: NewCveContents(
-							CveContent{
-								Type:          Debian,
-								CveID:         "CVE-2017-0002",
-								Cvss3Severity: "CRITICAL",
-								LastModified:  time.Time{},
-							},
-						),
-					},
-					"CVE-2017-0003": {
-						CveID: "CVE-2017-0003",
-						CveContents: NewCveContents(
-							CveContent{
-								Type:          GitHub,
-								CveID:         "CVE-2017-0003",
-								Cvss3Severity: "IMPORTANT",
-								LastModified:  time.Time{},
-							},
-						),
-					},
-				},
-			},
-		},
-	}
-	pp.ColoringEnabled = false
-	for i, tt := range tests {
-		actual := tt.in.rs.FilterByCvssOver(tt.in.over)
-		for k := range tt.out.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%d: %s] expected: %v\n  actual: %v\n", i, k, o, a)
-			}
-		}
-	}
-}
-func TestFilterIgnoreCveIDs(t *testing.T) {
-	type in struct {
-		cves []string
-		rs   ScanResult
-	}
-	var tests = []struct {
-		in  in
-		out ScanResult
-	}{
-		{
-			in: in{
-				cves: []string{"CVE-2017-0002"},
-				rs: ScanResult{
-					ServerName: "name",
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-						},
-						"CVE-2017-0002": {
-							CveID: "CVE-2017-0002",
-						},
-						"CVE-2017-0003": {
-							CveID: "CVE-2017-0003",
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ServerName: "name",
-				ScannedCves: VulnInfos{
-					"CVE-2017-0001": {
-						CveID: "CVE-2017-0001",
-					},
-					"CVE-2017-0003": {
-						CveID: "CVE-2017-0003",
-					},
-				},
-			},
-		},
-	}
-	for _, tt := range tests {
-		config.Conf.Servers = map[string]config.ServerInfo{
-			"name": {IgnoreCves: tt.in.cves},
-		}
-		actual := tt.in.rs.FilterIgnoreCves()
-		for k := range tt.out.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
-			}
-		}
-		for k := range actual.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
-			}
-		}
-	}
-}
-
-func TestFilterIgnoreCveIDsContainer(t *testing.T) {
-	type in struct {
-		cves []string
-		rs   ScanResult
-	}
-	var tests = []struct {
-		in  in
-		out ScanResult
-	}{
-		{
-			in: in{
-				cves: []string{"CVE-2017-0002"},
-				rs: ScanResult{
-					ServerName: "name",
-					Container:  Container{Name: "dockerA"},
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-						},
-						"CVE-2017-0002": {
-							CveID: "CVE-2017-0002",
-						},
-						"CVE-2017-0003": {
-							CveID: "CVE-2017-0003",
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ServerName: "name",
-				Container:  Container{Name: "dockerA"},
-				ScannedCves: VulnInfos{
-					"CVE-2017-0001": {
-						CveID: "CVE-2017-0001",
-					},
-					"CVE-2017-0003": {
-						CveID: "CVE-2017-0003",
-					},
-				},
-			},
-		},
-	}
-	for _, tt := range tests {
-		config.Conf.Servers = map[string]config.ServerInfo{
-			"name": {
-				Containers: map[string]config.ContainerSetting{
-					"dockerA": {
-						IgnoreCves: tt.in.cves,
-					},
-				},
-			},
-		}
-		actual := tt.in.rs.FilterIgnoreCves()
-		for k := range tt.out.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
-			}
-		}
-		for k := range actual.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
-			}
-		}
-	}
-}
-
-func TestFilterUnfixed(t *testing.T) {
-	var tests = []struct {
-		in  ScanResult
-		out ScanResult
-	}{
-		{
-			in: ScanResult{
-				ScannedCves: VulnInfos{
-					"CVE-2017-0001": {
-						CveID: "CVE-2017-0001",
-						AffectedPackages: PackageFixStatuses{
-							{
-								Name:        "a",
-								NotFixedYet: true,
-							},
-						},
-					},
-					"CVE-2017-0002": {
-						CveID: "CVE-2017-0002",
-						AffectedPackages: PackageFixStatuses{
-							{
-								Name:        "b",
-								NotFixedYet: false,
-							},
-						},
-					},
-					"CVE-2017-0003": {
-						CveID: "CVE-2017-0003",
-						AffectedPackages: PackageFixStatuses{
-							{
-								Name:        "c",
-								NotFixedYet: true,
-							},
-							{
-								Name:        "d",
-								NotFixedYet: false,
-							},
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ScannedCves: VulnInfos{
-					"CVE-2017-0002": {
-						CveID: "CVE-2017-0002",
-						AffectedPackages: PackageFixStatuses{
-							{
-								Name:        "b",
-								NotFixedYet: false,
-							},
-						},
-					},
-					"CVE-2017-0003": {
-						CveID: "CVE-2017-0003",
-						AffectedPackages: PackageFixStatuses{
-							{
-								Name:        "c",
-								NotFixedYet: true,
-							},
-							{
-								Name:        "d",
-								NotFixedYet: false,
-							},
-						},
-					},
-				},
-			},
-		},
-	}
-	for i, tt := range tests {
-		actual := tt.in.FilterUnfixed(true)
-		if !reflect.DeepEqual(tt.out.ScannedCves, actual.ScannedCves) {
-			o := pp.Sprintf("%v", tt.out.ScannedCves)
-			a := pp.Sprintf("%v", actual.ScannedCves)
-			t.Errorf("[%d] expected: %v\n  actual: %v\n", i, o, a)
-		}
-	}
-}
-
-func TestFilterIgnorePkgs(t *testing.T) {
-	type in struct {
-		ignorePkgsRegexp []string
-		rs               ScanResult
-	}
-	var tests = []struct {
-		in  in
-		out ScanResult
-	}{
-		{
-			in: in{
-				ignorePkgsRegexp: []string{"^kernel"},
-				rs: ScanResult{
-					ServerName: "name",
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-							AffectedPackages: PackageFixStatuses{
-								{Name: "kernel"},
-							},
-						},
-						"CVE-2017-0002": {
-							CveID: "CVE-2017-0002",
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ServerName: "name",
-				ScannedCves: VulnInfos{
-					"CVE-2017-0002": {
-						CveID: "CVE-2017-0002",
-					},
-				},
-			},
-		},
-		{
-			in: in{
-				ignorePkgsRegexp: []string{"^kernel"},
-				rs: ScanResult{
-					ServerName: "name",
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-							AffectedPackages: PackageFixStatuses{
-								{Name: "kernel"},
-								{Name: "vim"},
-							},
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ServerName: "name",
-				ScannedCves: VulnInfos{
-					"CVE-2017-0001": {
-						CveID: "CVE-2017-0001",
-						AffectedPackages: PackageFixStatuses{
-							{Name: "kernel"},
-							{Name: "vim"},
-						},
-					},
-				},
-			},
-		},
-		{
-			in: in{
-				ignorePkgsRegexp: []string{"^kernel", "^vim", "^bind"},
-				rs: ScanResult{
-					ServerName: "name",
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-							AffectedPackages: PackageFixStatuses{
-								{Name: "kernel"},
-								{Name: "vim"},
-							},
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ServerName:  "name",
-				ScannedCves: VulnInfos{},
-			},
-		},
-	}
-	for _, tt := range tests {
-		config.Conf.Servers = map[string]config.ServerInfo{
-			"name": {IgnorePkgsRegexp: tt.in.ignorePkgsRegexp},
-		}
-		actual := tt.in.rs.FilterIgnorePkgs()
-		for k := range tt.out.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
-			}
-		}
-		for k := range actual.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
-			}
-		}
-	}
-}
-
-func TestFilterIgnorePkgsContainer(t *testing.T) {
-	type in struct {
-		ignorePkgsRegexp []string
-		rs               ScanResult
-	}
-	var tests = []struct {
-		in  in
-		out ScanResult
-	}{
-		{
-			in: in{
-				ignorePkgsRegexp: []string{"^kernel"},
-				rs: ScanResult{
-					ServerName: "name",
-					Container:  Container{Name: "dockerA"},
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-							AffectedPackages: PackageFixStatuses{
-								{Name: "kernel"},
-							},
-						},
-						"CVE-2017-0002": {
-							CveID: "CVE-2017-0002",
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ServerName: "name",
-				Container:  Container{Name: "dockerA"},
-				ScannedCves: VulnInfos{
-					"CVE-2017-0002": {
-						CveID: "CVE-2017-0002",
-					},
-				},
-			},
-		},
-		{
-			in: in{
-				ignorePkgsRegexp: []string{"^kernel"},
-				rs: ScanResult{
-					ServerName: "name",
-					Container:  Container{Name: "dockerA"},
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-							AffectedPackages: PackageFixStatuses{
-								{Name: "kernel"},
-								{Name: "vim"},
-							},
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ServerName: "name",
-				Container:  Container{Name: "dockerA"},
-				ScannedCves: VulnInfos{
-					"CVE-2017-0001": {
-						CveID: "CVE-2017-0001",
-						AffectedPackages: PackageFixStatuses{
-							{Name: "kernel"},
-							{Name: "vim"},
-						},
-					},
-				},
-			},
-		},
-		{
-			in: in{
-				ignorePkgsRegexp: []string{"^kernel", "^vim", "^bind"},
-				rs: ScanResult{
-					ServerName: "name",
-					Container:  Container{Name: "dockerA"},
-					ScannedCves: VulnInfos{
-						"CVE-2017-0001": {
-							CveID: "CVE-2017-0001",
-							AffectedPackages: PackageFixStatuses{
-								{Name: "kernel"},
-								{Name: "vim"},
-							},
-						},
-					},
-				},
-			},
-			out: ScanResult{
-				ServerName:  "name",
-				Container:   Container{Name: "dockerA"},
-				ScannedCves: VulnInfos{},
-			},
-		},
-	}
-	for _, tt := range tests {
-		config.Conf.Servers = map[string]config.ServerInfo{
-			"name": {
-				Containers: map[string]config.ContainerSetting{
-					"dockerA": {
-						IgnorePkgsRegexp: tt.in.ignorePkgsRegexp,
-					},
-				},
-			},
-		}
-		actual := tt.in.rs.FilterIgnorePkgs()
-		for k := range tt.out.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
-			}
-		}
-		for k := range actual.ScannedCves {
-			if !reflect.DeepEqual(tt.out.ScannedCves[k], actual.ScannedCves[k]) {
-				o := pp.Sprintf("%v", tt.out.ScannedCves[k])
-				a := pp.Sprintf("%v", actual.ScannedCves[k])
-				t.Errorf("[%s] expected: %v\n  actual: %v\n", k, o, a)
-			}
-		}
-	}
-}
 
 func TestIsDisplayUpdatableNum(t *testing.T) {
 	var tests = []struct {
@@ -653,52 +29,67 @@ func TestIsDisplayUpdatableNum(t *testing.T) {
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.RedHat,
+			family:   constant.RedHat,
 			expected: false,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.Oracle,
+			family:   constant.Oracle,
 			expected: false,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.Debian,
+			family:   constant.Debian,
 			expected: false,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.Ubuntu,
+			family:   constant.Ubuntu,
 			expected: false,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.Raspbian,
+			family:   constant.Raspbian,
 			expected: false,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.CentOS,
+			family:   constant.CentOS,
 			expected: true,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.Amazon,
+			family:   constant.Alma,
 			expected: true,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.FreeBSD,
+			family:   constant.Rocky,
+			expected: true,
+		},
+		{
+			mode:     []byte{config.Fast},
+			family:   constant.Amazon,
+			expected: true,
+		},
+		{
+			mode:     []byte{config.Fast},
+			family:   constant.FreeBSD,
 			expected: false,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.OpenSUSE,
+			family:   constant.OpenSUSE,
 			expected: true,
 		},
 		{
 			mode:     []byte{config.Fast},
-			family:   config.Alpine,
+			family:   constant.Alpine,
+			expected: true,
+		},
+		{
+			mode:     []byte{config.Fast},
+			family:   constant.Fedora,
 			expected: true,
 		},
 	}
@@ -708,16 +99,621 @@ func TestIsDisplayUpdatableNum(t *testing.T) {
 		for _, m := range tt.mode {
 			mode.Set(m)
 		}
-		config.Conf.Servers = map[string]config.ServerInfo{
-			"name": {Mode: mode},
-		}
 		r := ScanResult{
 			ServerName: "name",
 			Family:     tt.family,
 		}
-		act := r.isDisplayUpdatableNum()
+		act := r.isDisplayUpdatableNum(mode)
 		if tt.expected != act {
 			t.Errorf("[%d] expected %#v, actual %#v", i, tt.expected, act)
 		}
+	}
+}
+
+func TestScanResult_Sort(t *testing.T) {
+	type fields struct {
+		Packages    Packages
+		ScannedCves VulnInfos
+	}
+	tests := []struct {
+		name     string
+		fields   fields
+		expected fields
+	}{
+		{
+			name: "already asc",
+			fields: fields{
+				Packages: map[string]Package{
+					"pkgA": {
+						Name: "pkgA",
+						AffectedProcs: []AffectedProcess{
+							{PID: "1", Name: "procB"},
+							{PID: "2", Name: "procA"},
+						},
+						NeedRestartProcs: []NeedRestartProcess{
+							{PID: "1"},
+							{PID: "2"},
+						},
+					},
+				},
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						AffectedPackages: PackageFixStatuses{
+							PackageFixStatus{Name: "pkgA"},
+							PackageFixStatus{Name: "pkgB"},
+						},
+						DistroAdvisories: []DistroAdvisory{
+							{AdvisoryID: "adv-1"},
+							{AdvisoryID: "adv-2"},
+						},
+						Exploits: []Exploit{
+							{URL: "a"},
+							{URL: "b"},
+						},
+						Metasploits: []Metasploit{
+							{Name: "a"},
+							{Name: "b"},
+						},
+						CveContents: CveContents{
+							"nvd": []CveContent{{
+								References: References{
+									Reference{Link: "a"},
+									Reference{Link: "b"},
+								}},
+							},
+							"jvn": []CveContent{{
+								References: References{
+									Reference{Link: "a"},
+									Reference{Link: "b"},
+								}},
+							},
+						},
+						AlertDict: AlertDict{
+							USCERT: []Alert{
+								{Title: "a"},
+								{Title: "b"},
+							},
+							JPCERT: []Alert{
+								{Title: "a"},
+								{Title: "b"},
+							},
+						},
+						CTIs: []string{"CAPEC-115", "T1552"},
+					},
+				},
+			},
+			expected: fields{
+				Packages: map[string]Package{
+					"pkgA": {
+						Name: "pkgA",
+						AffectedProcs: []AffectedProcess{
+							{PID: "1", Name: "procB"},
+							{PID: "2", Name: "procA"},
+						},
+						NeedRestartProcs: []NeedRestartProcess{
+							{PID: "1"},
+							{PID: "2"},
+						},
+					},
+				},
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						AffectedPackages: PackageFixStatuses{
+							PackageFixStatus{Name: "pkgA"},
+							PackageFixStatus{Name: "pkgB"},
+						},
+						DistroAdvisories: []DistroAdvisory{
+							{AdvisoryID: "adv-1"},
+							{AdvisoryID: "adv-2"},
+						},
+						Exploits: []Exploit{
+							{URL: "a"},
+							{URL: "b"},
+						},
+						Metasploits: []Metasploit{
+							{Name: "a"},
+							{Name: "b"},
+						},
+						CveContents: CveContents{
+							"nvd": []CveContent{{
+								References: References{
+									Reference{Link: "a"},
+									Reference{Link: "b"},
+								}},
+							},
+							"jvn": []CveContent{{
+								References: References{
+									Reference{Link: "a"},
+									Reference{Link: "b"},
+								}},
+							},
+						},
+						AlertDict: AlertDict{
+							USCERT: []Alert{
+								{Title: "a"},
+								{Title: "b"},
+							},
+							JPCERT: []Alert{
+								{Title: "a"},
+								{Title: "b"},
+							},
+						},
+						CTIs: []string{"CAPEC-115", "T1552"},
+					},
+				},
+			},
+		},
+		{
+			name: "sort",
+			fields: fields{
+				Packages: map[string]Package{
+					"pkgA": {
+						Name: "pkgA",
+						AffectedProcs: []AffectedProcess{
+							{PID: "2", Name: "procA"},
+							{PID: "1", Name: "procB"},
+						},
+						NeedRestartProcs: []NeedRestartProcess{
+							{PID: "91"},
+							{PID: "90"},
+						},
+					},
+				},
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						AffectedPackages: PackageFixStatuses{
+							PackageFixStatus{Name: "pkgB"},
+							PackageFixStatus{Name: "pkgA"},
+						},
+						DistroAdvisories: []DistroAdvisory{
+							{AdvisoryID: "adv-2"},
+							{AdvisoryID: "adv-1"},
+						},
+						Exploits: []Exploit{
+							{URL: "b"},
+							{URL: "a"},
+						},
+						Metasploits: []Metasploit{
+							{Name: "b"},
+							{Name: "a"},
+						},
+						CveContents: CveContents{
+							"nvd": []CveContent{{
+								References: References{
+									Reference{Link: "b"},
+									Reference{Link: "a"},
+								}},
+							},
+							"jvn": []CveContent{{
+								References: References{
+									Reference{Link: "b"},
+									Reference{Link: "a"},
+								}},
+							},
+						},
+						AlertDict: AlertDict{
+							USCERT: []Alert{
+								{Title: "b"},
+								{Title: "a"},
+							},
+							JPCERT: []Alert{
+								{Title: "b"},
+								{Title: "a"},
+							},
+						},
+						CTIs: []string{"T1552", "CAPEC-115"},
+					},
+				},
+			},
+			expected: fields{
+				Packages: map[string]Package{
+					"pkgA": {
+						Name: "pkgA",
+						AffectedProcs: []AffectedProcess{
+							{PID: "1", Name: "procB"},
+							{PID: "2", Name: "procA"},
+						},
+						NeedRestartProcs: []NeedRestartProcess{
+							{PID: "90"},
+							{PID: "91"},
+						},
+					},
+				},
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						AffectedPackages: PackageFixStatuses{
+							PackageFixStatus{Name: "pkgA"},
+							PackageFixStatus{Name: "pkgB"},
+						},
+						DistroAdvisories: []DistroAdvisory{
+							{AdvisoryID: "adv-1"},
+							{AdvisoryID: "adv-2"},
+						},
+						Exploits: []Exploit{
+							{URL: "a"},
+							{URL: "b"},
+						},
+						Metasploits: []Metasploit{
+							{Name: "a"},
+							{Name: "b"},
+						},
+						CveContents: CveContents{
+							"nvd": []CveContent{{
+								References: References{
+									Reference{Link: "a"},
+									Reference{Link: "b"},
+								}},
+							},
+							"jvn": []CveContent{{
+								References: References{
+									Reference{Link: "a"},
+									Reference{Link: "b"},
+								}},
+							},
+						},
+						AlertDict: AlertDict{
+							USCERT: []Alert{
+								{Title: "a"},
+								{Title: "b"},
+							},
+							JPCERT: []Alert{
+								{Title: "a"},
+								{Title: "b"},
+							},
+						},
+						CTIs: []string{"CAPEC-115", "T1552"},
+					},
+				},
+			},
+		},
+		{
+			name: "sort JVN by cvss v3",
+			fields: fields{
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						CveContents: CveContents{
+							"jvn": []CveContent{
+								{Cvss3Score: 3},
+								{Cvss3Score: 10},
+							},
+						},
+					},
+				},
+			},
+			expected: fields{
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						CveContents: CveContents{
+							"jvn": []CveContent{
+								{Cvss3Score: 10},
+								{Cvss3Score: 3},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "sort JVN by cvss3, cvss2, sourceLink",
+			fields: fields{
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						CveContents: CveContents{
+							"jvn": []CveContent{
+								{
+									Cvss3Score: 3,
+									Cvss2Score: 3,
+									SourceLink: "https://jvndb.jvn.jp/ja/contents/2023/JVNDB-2023-001210.html",
+								},
+								{
+									Cvss3Score: 3,
+									Cvss2Score: 3,
+									SourceLink: "https://jvndb.jvn.jp/ja/contents/2021/JVNDB-2021-001210.html",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: fields{
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						CveContents: CveContents{
+							"jvn": []CveContent{
+								{
+									Cvss3Score: 3,
+									Cvss2Score: 3,
+									SourceLink: "https://jvndb.jvn.jp/ja/contents/2021/JVNDB-2021-001210.html",
+								},
+								{
+									Cvss3Score: 3,
+									Cvss2Score: 3,
+									SourceLink: "https://jvndb.jvn.jp/ja/contents/2023/JVNDB-2023-001210.html",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "sort JVN by cvss3, cvss2",
+			fields: fields{
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						CveContents: CveContents{
+							"jvn": []CveContent{
+								{
+									Cvss3Score: 3,
+									Cvss2Score: 1,
+								},
+								{
+									Cvss3Score: 3,
+									Cvss2Score: 10,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: fields{
+				ScannedCves: VulnInfos{
+					"CVE-2014-3591": VulnInfo{
+						CveContents: CveContents{
+							"jvn": []CveContent{
+								{
+									Cvss3Score: 3,
+									Cvss2Score: 10,
+								},
+								{
+									Cvss3Score: 3,
+									Cvss2Score: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "sort kev 1",
+			fields: fields{
+				ScannedCves: VulnInfos{
+					"CVE-0000-0000": VulnInfo{
+						KEVs: []KEV{
+							{Type: VulnCheckKEVType},
+							{Type: ENISAKEVType},
+							{Type: CISAKEVType},
+						},
+					},
+				},
+			},
+			expected: fields{
+				ScannedCves: VulnInfos{
+					"CVE-0000-0000": VulnInfo{
+						KEVs: []KEV{
+							{Type: CISAKEVType},
+							{Type: ENISAKEVType},
+							{Type: VulnCheckKEVType},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "sort kev 2",
+			fields: fields{
+				ScannedCves: VulnInfos{
+					"CVE-0000-0000": VulnInfo{
+						KEVs: []KEV{
+							{
+								Type:              CISAKEVType,
+								VulnerabilityName: "name 2",
+							},
+							{
+								Type:              CISAKEVType,
+								VulnerabilityName: "name 1",
+							},
+						},
+					},
+				},
+			},
+			expected: fields{
+				ScannedCves: VulnInfos{
+					"CVE-0000-0000": VulnInfo{
+						KEVs: []KEV{
+							{
+								Type:              CISAKEVType,
+								VulnerabilityName: "name 1",
+							},
+							{
+								Type:              CISAKEVType,
+								VulnerabilityName: "name 2",
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &ScanResult{
+				Packages:    tt.fields.Packages,
+				ScannedCves: tt.fields.ScannedCves,
+			}
+			r.SortForJSONOutput()
+			if !reflect.DeepEqual(r.Packages, tt.expected.Packages) {
+				t.Errorf("act %+v, want %+v", r.Packages, tt.expected.Packages)
+			}
+
+			if !reflect.DeepEqual(r.ScannedCves, tt.expected.ScannedCves) {
+				t.Errorf("act %+v, want %+v", r.ScannedCves, tt.expected.ScannedCves)
+			}
+		})
+	}
+}
+
+func TestCWEDict_Get(t *testing.T) {
+	type args struct {
+		cweID string
+		lang  string
+	}
+	tests := []struct {
+		name      string
+		c         CWEDict
+		args      args
+		wantName  string
+		wantURL   string
+		wantOwasp map[string]AttentionCWE
+		wantCwe25 map[string]AttentionCWE
+		wantSans  map[string]AttentionCWE
+	}{
+		{
+			name: "en/populated returns En name + mitre URL",
+			c: CWEDict{
+				"306": {
+					En:                 &cwe.CWE{CWEID: "306", Name: "Missing Authentication for Critical Function", Lang: "en"},
+					Ja:                 &cwe.CWE{CWEID: "306", Name: "重要な機能に対する認証の欠如", Lang: "ja"},
+					OwaspTopTens:       map[string]string{"2021": "7"},
+					CweTopTwentyfives:  map[string]string{"2024": "11"},
+					SansTopTwentyfives: map[string]string{"2011": "11"},
+				},
+			},
+			args:     args{cweID: "CWE-306", lang: "en"},
+			wantName: "Missing Authentication for Critical Function",
+			wantURL:  "https://cwe.mitre.org/data/definitions/CWE-306.html",
+			wantOwasp: map[string]AttentionCWE{"2021": {
+				Rank: "7",
+				URL:  cwe.OwaspTopTenURLsEn["2021"]["7"],
+			}},
+			wantCwe25: map[string]AttentionCWE{"2024": {
+				Rank: "11",
+				URL:  cwe.CweTopTwentyfiveURLs["2024"],
+			}},
+			wantSans: map[string]AttentionCWE{"2011": {
+				Rank: "11",
+				URL:  cwe.SansTopTwentyfiveURLs["2011"],
+			}},
+		},
+		{
+			name: "ja/Ja-populated returns Ja name + JVN URL",
+			c: CWEDict{
+				"306": {
+					En:                 &cwe.CWE{CWEID: "306", Name: "Missing Authentication for Critical Function", Lang: "en"},
+					Ja:                 &cwe.CWE{CWEID: "306", Name: "重要な機能に対する認証の欠如", Lang: "ja"},
+					OwaspTopTens:       map[string]string{"2021": "7"},
+					CweTopTwentyfives:  map[string]string{"2024": "11"},
+					SansTopTwentyfives: map[string]string{"2011": "11"},
+				},
+			},
+			args:     args{cweID: "CWE-306", lang: "ja"},
+			wantName: "重要な機能に対する認証の欠如",
+			wantURL:  "http://jvndb.jvn.jp/ja/cwe/CWE-306.html",
+			wantOwasp: map[string]AttentionCWE{"2021": {
+				Rank: "7",
+				URL:  cwe.OwaspTopTenURLsJa["2021"]["7"],
+			}},
+			wantCwe25: map[string]AttentionCWE{"2024": {
+				Rank: "11",
+				URL:  cwe.CweTopTwentyfiveURLs["2024"],
+			}},
+			wantSans: map[string]AttentionCWE{"2011": {
+				Rank: "11",
+				URL:  cwe.SansTopTwentyfiveURLs["2011"],
+			}},
+		},
+		{
+			name: "ja/Ja-nil falls back to En name + mitre URL",
+			c: CWEDict{
+				"79": {
+					En:                 &cwe.CWE{CWEID: "79", Name: "Cross-site Scripting", Lang: "en"},
+					OwaspTopTens:       map[string]string{},
+					CweTopTwentyfives:  map[string]string{},
+					SansTopTwentyfives: map[string]string{},
+				},
+			},
+			args:      args{cweID: "CWE-79", lang: "ja"},
+			wantName:  "Cross-site Scripting",
+			wantURL:   "https://cwe.mitre.org/data/definitions/CWE-79.html",
+			wantOwasp: map[string]AttentionCWE{},
+			wantCwe25: map[string]AttentionCWE{},
+			wantSans:  map[string]AttentionCWE{},
+		},
+		{
+			name: "ja/Ja-non-nil-empty-Name falls back to En name + mitre URL",
+			c: CWEDict{
+				"22": {
+					En:                 &cwe.CWE{CWEID: "22", Name: "Path Traversal", Lang: "en"},
+					Ja:                 &cwe.CWE{CWEID: "22", Lang: "ja"},
+					OwaspTopTens:       map[string]string{},
+					CweTopTwentyfives:  map[string]string{},
+					SansTopTwentyfives: map[string]string{},
+				},
+			},
+			args:      args{cweID: "CWE-22", lang: "ja"},
+			wantName:  "Path Traversal",
+			wantURL:   "https://cwe.mitre.org/data/definitions/CWE-22.html",
+			wantOwasp: map[string]AttentionCWE{},
+			wantCwe25: map[string]AttentionCWE{},
+			wantSans:  map[string]AttentionCWE{},
+		},
+		{
+			name: "id without CWE- prefix resolves the same entry",
+			c: CWEDict{
+				"306": {
+					En:                 &cwe.CWE{CWEID: "306", Name: "Missing Authentication for Critical Function", Lang: "en"},
+					OwaspTopTens:       map[string]string{},
+					CweTopTwentyfives:  map[string]string{},
+					SansTopTwentyfives: map[string]string{},
+				},
+			},
+			args:     args{cweID: "306", lang: "en"},
+			wantName: "Missing Authentication for Critical Function",
+			// Get uses the raw input when formatting URL, so the result keeps
+			// the input form — documented quirk of the existing API surface.
+			wantURL:   "https://cwe.mitre.org/data/definitions/306.html",
+			wantOwasp: map[string]AttentionCWE{},
+			wantCwe25: map[string]AttentionCWE{},
+			wantSans:  map[string]AttentionCWE{},
+		},
+		{
+			name:      "missing entry still returns mitre URL so Slack-style <url|id> links stay valid",
+			c:         CWEDict{},
+			args:      args{cweID: "CWE-999999", lang: "en"},
+			wantURL:   "https://cwe.mitre.org/data/definitions/CWE-999999.html",
+			wantOwasp: map[string]AttentionCWE{},
+			wantCwe25: map[string]AttentionCWE{},
+			wantSans:  map[string]AttentionCWE{},
+		},
+		{
+			name:      "missing entry ja falls through to mitre URL too",
+			c:         CWEDict{},
+			args:      args{cweID: "CWE-999999", lang: "ja"},
+			wantURL:   "https://cwe.mitre.org/data/definitions/CWE-999999.html",
+			wantOwasp: map[string]AttentionCWE{},
+			wantCwe25: map[string]AttentionCWE{},
+			wantSans:  map[string]AttentionCWE{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotName, gotURL, gotOwasp, gotCwe25, gotSans := tt.c.Get(tt.args.cweID, tt.args.lang)
+			if gotName != tt.wantName {
+				t.Errorf("CWEDict.Get() gotName = %v, want %v", gotName, tt.wantName)
+			}
+			if gotURL != tt.wantURL {
+				t.Errorf("CWEDict.Get() gotURL = %v, want %v", gotURL, tt.wantURL)
+			}
+			if !reflect.DeepEqual(gotOwasp, tt.wantOwasp) {
+				t.Errorf("CWEDict.Get() gotOwasp = %v, want %v", gotOwasp, tt.wantOwasp)
+			}
+			if !reflect.DeepEqual(gotCwe25, tt.wantCwe25) {
+				t.Errorf("CWEDict.Get() gotCwe25 = %v, want %v", gotCwe25, tt.wantCwe25)
+			}
+			if !reflect.DeepEqual(gotSans, tt.wantSans) {
+				t.Errorf("CWEDict.Get() gotSans = %v, want %v", gotSans, tt.wantSans)
+			}
+		})
 	}
 }

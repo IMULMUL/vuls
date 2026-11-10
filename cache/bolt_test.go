@@ -5,10 +5,11 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/boltdb/bolt"
+	bolt "go.etcd.io/bbolt"
+
 	"github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/logging"
 	"github.com/future-architect/vuls/models"
-	"github.com/sirupsen/logrus"
 )
 
 const path = "/tmp/vuls-test-cache-11111111.db"
@@ -29,7 +30,7 @@ var meta = Meta{
 }
 
 func TestSetupBolt(t *testing.T) {
-	log := logrus.NewEntry(&logrus.Logger{})
+	log := logging.NewNormalLogger()
 	err := SetupBolt(path, log)
 	if err != nil {
 		t.Errorf("Failed to setup bolt: %s", err)
@@ -53,11 +54,10 @@ func TestSetupBolt(t *testing.T) {
 		}
 		return nil
 	})
-
 }
 
 func TestEnsureBuckets(t *testing.T) {
-	log := logrus.NewEntry(&logrus.Logger{})
+	log := logging.NewNormalLogger()
 	if err := SetupBolt(path, log); err != nil {
 		t.Errorf("Failed to setup bolt: %s", err)
 	}
@@ -98,7 +98,7 @@ func TestEnsureBuckets(t *testing.T) {
 
 func TestPutGetChangelog(t *testing.T) {
 	clog := "changelog-text"
-	log := logrus.NewEntry(&logrus.Logger{})
+	log := logging.NewNormalLogger()
 	if err := SetupBolt(path, log); err != nil {
 		t.Errorf("Failed to setup bolt: %s", err)
 	}

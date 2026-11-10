@@ -2,13 +2,15 @@ package models
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
-	"sort"
+	"maps"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
-	"github.com/future-architect/vuls/config"
-	exploitmodels "github.com/vulsio/go-exploitdb/models"
+	"github.com/future-architect/vuls/logging"
 )
 
 // VulnInfos has a map of VulnInfo
@@ -26,29 +28,118 @@ func (v VulnInfos) Find(f func(VulnInfo) bool) VulnInfos {
 	return filtered
 }
 
-// FindScoredVulns return scored vulnerabilities
-func (v VulnInfos) FindScoredVulns() VulnInfos {
-	return v.Find(func(vv VulnInfo) bool {
-		if 0 < vv.MaxCvss2Score().Value.Score ||
-			0 < vv.MaxCvss3Score().Value.Score {
+// FilterByCvssOver return scored vulnerabilities
+func (v VulnInfos) FilterByCvssOver(over float64) (_ VulnInfos, nFiltered int) {
+	return v.Find(func(v VulnInfo) bool {
+		if over <= v.MaxCvssScore().Value.Score {
 			return true
 		}
+		nFiltered++
 		return false
-	})
+	}), nFiltered
+}
+
+// FilterByConfidenceOver scored vulnerabilities
+func (v VulnInfos) FilterByConfidenceOver(over int) (_ VulnInfos, nFiltered int) {
+	return v.Find(func(v VulnInfo) bool {
+		for _, c := range v.Confidences {
+			if over <= c.Score {
+				return true
+			}
+		}
+		nFiltered++
+		return false
+	}), nFiltered
+}
+
+// FilterIgnoreCves filter function.
+func (v VulnInfos) FilterIgnoreCves(ignoreCveIDs []string) (_ VulnInfos, nFiltered int) {
+	return v.Find(func(v VulnInfo) bool {
+		if slices.Contains(ignoreCveIDs, v.CveID) {
+			nFiltered++
+			return false
+		}
+		return true
+	}), nFiltered
+}
+
+// FilterUnfixed filter unfixed CVE-IDs
+func (v VulnInfos) FilterUnfixed(ignoreUnfixed bool) (_ VulnInfos, nFiltered int) {
+	if !ignoreUnfixed {
+		return v, 0
+	}
+	return v.Find(func(v VulnInfo) bool {
+		// Report cves detected by CPE because Vuls can't know 'fixed' or 'unfixed'
+		if len(v.CpeURIs) != 0 {
+			return true
+		}
+		NotFixedAll := true
+		for _, p := range v.AffectedPackages {
+			NotFixedAll = NotFixedAll && p.NotFixedYet
+		}
+		if NotFixedAll {
+			nFiltered++
+		}
+		return !NotFixedAll
+	}), nFiltered
+}
+
+// FilterIgnorePkgs is filter function.
+func (v VulnInfos) FilterIgnorePkgs(ignorePkgsRegexps []string) (_ VulnInfos, nFiltered int) {
+	regexps := []*regexp.Regexp{}
+	for _, pkgRegexp := range ignorePkgsRegexps {
+		re, err := regexp.Compile(pkgRegexp)
+		if err != nil {
+			logging.Log.Warnf("Failed to parse %s. err: %+v", pkgRegexp, err)
+			continue
+		}
+		regexps = append(regexps, re)
+	}
+	if len(regexps) == 0 {
+		return v, 0
+	}
+
+	return v.Find(func(v VulnInfo) bool {
+		if len(v.AffectedPackages) == 0 {
+			return true
+		}
+		for _, p := range v.AffectedPackages {
+			match := false
+			for _, re := range regexps {
+				if re.MatchString(p.Name) {
+					match = true
+				}
+			}
+			if !match {
+				return true
+			}
+		}
+		nFiltered++
+		return false
+	}), nFiltered
+}
+
+// FindScoredVulns return scored vulnerabilities
+func (v VulnInfos) FindScoredVulns() (_ VulnInfos, nFiltered int) {
+	return v.Find(func(vv VulnInfo) bool {
+		if 0 < vv.MaxCvss2Score().Value.Score || 0 < vv.MaxCvss3Score().Value.Score || 0 < vv.MaxCvss40Score().Value.Score {
+			return true
+		}
+		nFiltered++
+		return false
+	}), nFiltered
 }
 
 // ToSortedSlice returns slice of VulnInfos that is sorted by Score, CVE-ID
 func (v VulnInfos) ToSortedSlice() (sorted []VulnInfo) {
-	for k := range v {
-		sorted = append(sorted, v[k])
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		maxI := sorted[i].MaxCvssScore()
-		maxJ := sorted[j].MaxCvssScore()
-		if maxI.Value.Score != maxJ.Value.Score {
-			return maxJ.Value.Score < maxI.Value.Score
-		}
-		return sorted[i].CveID < sorted[j].CveID
+	sorted = slices.Collect(maps.Values(v))
+	slices.SortFunc(sorted, func(a, b VulnInfo) int {
+		maxA := a.MaxCvssScore()
+		maxB := b.MaxCvssScore()
+		return cmp.Or(
+			-cmp.Compare(maxA.Value.Score, maxB.Value.Score),
+			cmp.Compare(a.CveID, b.CveID),
+		)
 	})
 	return
 }
@@ -57,7 +148,10 @@ func (v VulnInfos) ToSortedSlice() (sorted []VulnInfo) {
 func (v VulnInfos) CountGroupBySeverity() map[string]int {
 	m := map[string]int{}
 	for _, vInfo := range v {
-		score := vInfo.MaxCvss3Score().Value.Score
+		score := vInfo.MaxCvss40Score().Value.Score
+		if score < 0.1 {
+			score = vInfo.MaxCvss3Score().Value.Score
+		}
 		if score < 0.1 {
 			score = vInfo.MaxCvss2Score().Value.Score
 		}
@@ -78,19 +172,14 @@ func (v VulnInfos) CountGroupBySeverity() map[string]int {
 }
 
 // FormatCveSummary summarize the number of CVEs group by CVSSv2 Severity
-func (v VulnInfos) FormatCveSummary() (line string) {
+func (v VulnInfos) FormatCveSummary() string {
 	m := v.CountGroupBySeverity()
-	if config.Conf.IgnoreUnscoredCves {
-		line = fmt.Sprintf("Total: %d (Critical:%d High:%d Medium:%d Low:%d)",
-			m["High"]+m["Medium"]+m["Low"], m["Critical"], m["High"], m["Medium"], m["Low"])
-	} else {
-		line = fmt.Sprintf("Total: %d (Critical:%d High:%d Medium:%d Low:%d ?:%d)",
-			m["High"]+m["Medium"]+m["Low"]+m["Unknown"],
-			m["Critical"], m["High"], m["Medium"], m["Low"], m["Unknown"])
-	}
+	line := fmt.Sprintf("Total: %d (Critical:%d High:%d Medium:%d Low:%d ?:%d)",
+		m["Critical"]+m["High"]+m["Medium"]+m["Low"]+m["Unknown"],
+		m["Critical"], m["High"], m["Medium"], m["Low"], m["Unknown"])
 
-	if config.Conf.DiffMinus || config.Conf.DiffPlus {
-		nPlus, nMinus := v.CountDiff()
+	nPlus, nMinus := v.CountDiff()
+	if 0 < nPlus || 0 < nMinus {
 		line = fmt.Sprintf("%s +%d -%d", line, nPlus, nMinus)
 	}
 	return line
@@ -100,9 +189,6 @@ func (v VulnInfos) FormatCveSummary() (line string) {
 func (v VulnInfos) FormatFixedStatus(packs Packages) string {
 	total, fixed := 0, 0
 	for _, vInfo := range v {
-		if len(vInfo.CpeURIs) != 0 {
-			continue
-		}
 		total++
 		if vInfo.PatchStatus(packs) == "fixed" {
 			fixed++
@@ -114,10 +200,12 @@ func (v VulnInfos) FormatFixedStatus(packs Packages) string {
 // CountDiff counts the number of added/removed CVE-ID
 func (v VulnInfos) CountDiff() (nPlus int, nMinus int) {
 	for _, vInfo := range v {
-		if vInfo.DiffStatus == DiffPlus {
+		switch vInfo.DiffStatus {
+		case DiffPlus:
 			nPlus++
-		} else if vInfo.DiffStatus == DiffMinus {
+		case DiffMinus:
 			nMinus++
+		default:
 		}
 	}
 	return
@@ -146,12 +234,14 @@ func (ps PackageFixStatuses) Store(pkg PackageFixStatus) PackageFixStatuses {
 	return ps
 }
 
-// Sort by Name
+// Sort by Name asc, FixedIn desc
 func (ps PackageFixStatuses) Sort() {
-	sort.Slice(ps, func(i, j int) bool {
-		return ps[i].Name < ps[j].Name
+	slices.SortFunc(ps, func(a, b PackageFixStatus) int {
+		return cmp.Or(
+			cmp.Compare(a.Name, b.Name),
+			cmp.Compare(b.FixedIn, a.FixedIn),
+		)
 	})
-	return
 }
 
 // PackageFixStatus has name and other status about the package
@@ -167,16 +257,19 @@ type VulnInfo struct {
 	CveID                string               `json:"cveID,omitempty"`
 	Confidences          Confidences          `json:"confidences,omitempty"`
 	AffectedPackages     PackageFixStatuses   `json:"affectedPackages,omitempty"`
-	DistroAdvisories     DistroAdvisories     `json:"distroAdvisories,omitempty"` // for Amazon, RHEL, FreeBSD
+	DistroAdvisories     DistroAdvisories     `json:"distroAdvisories,omitempty"` // for Amazon, RHEL, Fedora, FreeBSD, Microsoft
 	CveContents          CveContents          `json:"cveContents,omitempty"`
-	Exploits             []Exploit            `json:"exploits,omitempty"`
+	Exploits             Exploits             `json:"exploits,omitempty"`
 	Metasploits          []Metasploit         `json:"metasploits,omitempty"`
-	Mitigations          []Mitigation         `json:"mitigations,omitempty"`
-	AlertDict            AlertDict            `json:"alertDict,omitempty"`
+	Mitigations          Mitigations          `json:"mitigations,omitempty"`
+	KEVs                 []KEV                `json:"kevs,omitempty"`
+	CTIs                 []string             `json:"ctis,omitempty"`
+	AlertDict            AlertDict            `json:"alertDict,omitzero"`
 	CpeURIs              []string             `json:"cpeURIs,omitempty"` // CpeURIs related to this CVE defined in config.toml
 	GitHubSecurityAlerts GitHubSecurityAlerts `json:"gitHubSecurityAlerts,omitempty"`
 	WpPackageFixStats    WpPackageFixStats    `json:"wpPackageFixStats,omitempty"`
 	LibraryFixedIns      LibraryFixedIns      `json:"libraryFixedIns,omitempty"`
+	WindowsKBFixedIns    []string             `json:"windowsKBFixedIns,omitempty"`
 	VulnType             string               `json:"vulnType,omitempty"`
 	DiffStatus           DiffStatus           `json:"diffStatus,omitempty"`
 }
@@ -194,7 +287,7 @@ type GitHubSecurityAlerts []GitHubSecurityAlert
 // Add adds given arg to the slice and return the slice (immutable)
 func (g GitHubSecurityAlerts) Add(alert GitHubSecurityAlert) GitHubSecurityAlerts {
 	for _, a := range g {
-		if a.PackageName == alert.PackageName {
+		if a.RepoURLPackageName() == alert.RepoURLPackageName() {
 			return g
 		}
 	}
@@ -204,19 +297,39 @@ func (g GitHubSecurityAlerts) Add(alert GitHubSecurityAlert) GitHubSecurityAlert
 // Names return a slice of lib names
 func (g GitHubSecurityAlerts) Names() (names []string) {
 	for _, a := range g {
-		names = append(names, a.PackageName)
+		names = append(names, a.RepoURLPackageName())
 	}
 	return names
 }
 
-// GitHubSecurityAlert has detected CVE-ID, PackageName, Status fetched via GitHub API
+// GitHubSecurityAlert has detected CVE-ID, GSAVulnerablePackage, Status fetched via GitHub API
 type GitHubSecurityAlert struct {
-	PackageName   string    `json:"packageName"`
-	FixedIn       string    `json:"fixedIn"`
-	AffectedRange string    `json:"affectedRange"`
-	Dismissed     bool      `json:"dismissed"`
-	DismissedAt   time.Time `json:"dismissedAt"`
-	DismissReason string    `json:"dismissReason"`
+	Repository    string               `json:"repository"`
+	Package       GSAVulnerablePackage `json:"package,omitzero"`
+	FixedIn       string               `json:"fixedIn"`
+	AffectedRange string               `json:"affectedRange"`
+	Dismissed     bool                 `json:"dismissed"`
+	DismissedAt   time.Time            `json:"dismissedAt"`
+	DismissReason string               `json:"dismissReason"`
+}
+
+// RepoURLPackageName returns a string connecting the repository and package name
+func (a GitHubSecurityAlert) RepoURLPackageName() string {
+	return fmt.Sprintf("%s %s", a.Repository, a.Package.Name)
+}
+
+// RepoURLManifestPath should be same format with DependencyGraphManifest.RepoURLFilename()
+func (a GitHubSecurityAlert) RepoURLManifestPath() string {
+	return fmt.Sprintf("%s/%s", a.Repository, a.Package.ManifestPath)
+}
+
+// GSAVulnerablePackage has vulnerable package information
+type GSAVulnerablePackage struct {
+	Name             string `json:"name"`
+	Ecosystem        string `json:"ecosystem"`
+	ManifestFilename string `json:"manifestFilename"`
+	ManifestPath     string `json:"manifestPath"`
+	Requirements     string `json:"requirements"`
 }
 
 // LibraryFixedIns is a list of Library's FixedIn
@@ -266,47 +379,62 @@ const (
 )
 
 // CveIDDiffFormat format CVE-ID for diff mode
-func (v VulnInfo) CveIDDiffFormat(isDiffMode bool) string {
-	if isDiffMode {
+func (v VulnInfo) CveIDDiffFormat() string {
+	if v.DiffStatus != "" {
 		return fmt.Sprintf("%s %s", v.DiffStatus, v.CveID)
 	}
-	return fmt.Sprintf("%s", v.CveID)
+	return v.CveID
 }
 
 // Titles returns title (TUI)
 func (v VulnInfo) Titles(lang, myFamily string) (values []CveContentStr) {
 	if lang == "ja" {
-		if cont, found := v.CveContents[Jvn]; found && cont.Title != "" {
-			values = append(values, CveContentStr{Jvn, cont.Title})
+		if conts, found := v.CveContents[Jvn]; found {
+			for _, cont := range conts {
+				if cont.Title != "" {
+					values = append(values, CveContentStr{Jvn, cont.Title})
+				}
+			}
 		}
 	}
 
 	// RedHat API has one line title.
-	if cont, found := v.CveContents[RedHatAPI]; found && cont.Title != "" {
-		values = append(values, CveContentStr{RedHatAPI, cont.Title})
+	if conts, found := v.CveContents[RedHatAPI]; found {
+		for _, cont := range conts {
+			if cont.Title != "" {
+				values = append(values, CveContentStr{RedHatAPI, cont.Title})
+			}
+		}
 	}
 
 	// GitHub security alerts has a title.
-	if cont, found := v.CveContents[GitHub]; found && cont.Title != "" {
-		values = append(values, CveContentStr{GitHub, cont.Title})
+	if conts, found := v.CveContents[GitHub]; found {
+		for _, cont := range conts {
+			if cont.Title != "" {
+				values = append(values, CveContentStr{GitHub, cont.Title})
+			}
+		}
 	}
 
-	order := CveContentTypes{Trivy, Nvd, NewCveContentType(myFamily)}
+	order := append(GetCveContentTypes(string(Trivy)), append(CveContentTypes{Cisco, Paloalto, Fortinet, Euvd, Nvd, Vulncheck, Mitre}, GetCveContentTypes(myFamily)...)...)
 	order = append(order, AllCveContetTypes.Except(append(order, Jvn)...)...)
 	for _, ctype := range order {
-		if cont, found := v.CveContents[ctype]; found && cont.Summary != "" {
-			summary := strings.Replace(cont.Summary, "\n", " ", -1)
-			values = append(values, CveContentStr{
-				Type:  ctype,
-				Value: summary,
-			})
+		if conts, found := v.CveContents[ctype]; found {
+			for _, cont := range conts {
+				if cont.Summary != "" {
+					values = append(values, CveContentStr{
+						Type:  ctype,
+						Value: strings.ReplaceAll(cont.Summary, "\n", " "),
+					})
+				}
+			}
 		}
 	}
 
 	for _, adv := range v.DistroAdvisories {
 		values = append(values, CveContentStr{
 			Type:  "Vendor",
-			Value: strings.Replace(adv.Description, "\n", " ", -1),
+			Value: strings.ReplaceAll(adv.Description, "\n", " "),
 		})
 	}
 
@@ -322,23 +450,30 @@ func (v VulnInfo) Titles(lang, myFamily string) (values []CveContentStr) {
 // Summaries returns summaries
 func (v VulnInfo) Summaries(lang, myFamily string) (values []CveContentStr) {
 	if lang == "ja" {
-		if cont, found := v.CveContents[Jvn]; found && cont.Summary != "" {
-			summary := cont.Title
-			summary += "\n" + strings.Replace(
-				strings.Replace(cont.Summary, "\n", " ", -1), "\r", " ", -1)
-			values = append(values, CveContentStr{Jvn, summary})
+		if conts, found := v.CveContents[Jvn]; found {
+			for _, cont := range conts {
+				if cont.Summary != "" {
+					summary := cont.Title
+					summary += "\n" + strings.ReplaceAll(strings.ReplaceAll(cont.Summary, "\n", " "), "\r", " ")
+					values = append(values, CveContentStr{Jvn, summary})
+				}
+			}
 		}
 	}
 
-	order := CveContentTypes{Trivy, NewCveContentType(myFamily), Nvd, GitHub}
+	order := append(append(GetCveContentTypes(string(Trivy)), GetCveContentTypes(myFamily)...), Cisco, Paloalto, Fortinet, Euvd, Nvd, Vulncheck, Mitre, GitHub)
 	order = append(order, AllCveContetTypes.Except(append(order, Jvn)...)...)
 	for _, ctype := range order {
-		if cont, found := v.CveContents[ctype]; found && cont.Summary != "" {
-			summary := strings.Replace(cont.Summary, "\n", " ", -1)
-			values = append(values, CveContentStr{
-				Type:  ctype,
-				Value: summary,
-			})
+		if conts, found := v.CveContents[ctype]; found {
+			for _, cont := range conts {
+				if cont.Summary != "" {
+					summary := strings.ReplaceAll(cont.Summary, "\n", " ")
+					values = append(values, CveContentStr{
+						Type:  ctype,
+						Value: summary,
+					})
+				}
+			}
 		}
 	}
 
@@ -349,11 +484,15 @@ func (v VulnInfo) Summaries(lang, myFamily string) (values []CveContentStr) {
 		})
 	}
 
-	if v, ok := v.CveContents[WpScan]; ok {
-		values = append(values, CveContentStr{
-			Type:  WpScan,
-			Value: v.Title,
-		})
+	if conts, ok := v.CveContents[WpScan]; ok {
+		for _, cont := range conts {
+			if cont.Title != "" {
+				values = append(values, CveContentStr{
+					Type:  WpScan,
+					Value: cont.Title,
+				})
+			}
+		}
 	}
 
 	if len(values) == 0 {
@@ -368,22 +507,25 @@ func (v VulnInfo) Summaries(lang, myFamily string) (values []CveContentStr) {
 
 // Cvss2Scores returns CVSS V2 Scores
 func (v VulnInfo) Cvss2Scores() (values []CveContentCvss) {
-	order := []CveContentType{RedHatAPI, RedHat, Nvd, Jvn}
+	order := append([]CveContentType{RedHatAPI, RedHat, Solaris, Nvd, Vulncheck, Mitre, Jvn, Euvd}, GetCveContentTypes(string(Trivy))...)
 	for _, ctype := range order {
-		if cont, found := v.CveContents[ctype]; found {
-			if cont.Cvss2Score == 0 && cont.Cvss2Severity == "" {
-				continue
+		if conts, found := v.CveContents[ctype]; found {
+			for _, cont := range conts {
+				if cont.Cvss2Score == 0 && cont.Cvss2Severity == "" {
+					continue
+				}
+				// https://nvd.nist.gov/vuln-metrics/cvss
+				values = append(values, CveContentCvss{
+					Type:   ctype,
+					Source: cont.Optional["source"],
+					Value: Cvss{
+						Type:     CVSS2,
+						Score:    cont.Cvss2Score,
+						Vector:   cont.Cvss2Vector,
+						Severity: strings.ToUpper(cont.Cvss2Severity),
+					},
+				})
 			}
-			// https://nvd.nist.gov/vuln-metrics/cvss
-			values = append(values, CveContentCvss{
-				Type: ctype,
-				Value: Cvss{
-					Type:     CVSS2,
-					Score:    cont.Cvss2Score,
-					Vector:   cont.Cvss2Vector,
-					Severity: strings.ToUpper(cont.Cvss2Severity),
-				},
-			})
 		}
 	}
 	return
@@ -391,40 +533,61 @@ func (v VulnInfo) Cvss2Scores() (values []CveContentCvss) {
 
 // Cvss3Scores returns CVSS V3 Score
 func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
-	order := []CveContentType{RedHatAPI, RedHat, Nvd, Jvn}
+	order := append([]CveContentType{RedHatAPI, RedHat, Rocky, SUSE, Microsoft, Paloalto, Fortinet, Solaris, Nvd, Vulncheck, Mitre, Jvn, Euvd}, GetCveContentTypes(string(Trivy))...)
 	for _, ctype := range order {
-		if cont, found := v.CveContents[ctype]; found {
-			if cont.Cvss3Score == 0 && cont.Cvss3Severity == "" {
-				continue
+		if conts, found := v.CveContents[ctype]; found {
+			for _, cont := range conts {
+				if cont.Cvss3Score == 0 && cont.Cvss3Severity == "" {
+					continue
+				}
+				// https://nvd.nist.gov/vuln-metrics/cvss
+				values = append(values, CveContentCvss{
+					Type:   ctype,
+					Source: cont.Optional["source"],
+					Value: Cvss{
+						Type:     CVSS3,
+						Score:    cont.Cvss3Score,
+						Vector:   cont.Cvss3Vector,
+						Severity: strings.ToUpper(cont.Cvss3Severity),
+					},
+				})
 			}
-			// https://nvd.nist.gov/vuln-metrics/cvss
-			values = append(values, CveContentCvss{
-				Type: ctype,
-				Value: Cvss{
-					Type:     CVSS3,
-					Score:    cont.Cvss3Score,
-					Vector:   cont.Cvss3Vector,
-					Severity: strings.ToUpper(cont.Cvss3Severity),
-				},
-			})
 		}
 	}
 
-	for _, ctype := range []CveContentType{Debian, DebianSecurityTracker, Ubuntu, Amazon, Trivy, GitHub, WpScan} {
-		if cont, found := v.CveContents[ctype]; found && cont.Cvss3Severity != "" {
-			values = append(values, CveContentCvss{
-				Type: ctype,
-				Value: Cvss{
-					Type:                 CVSS3,
-					Score:                severityToCvssScoreRoughly(cont.Cvss3Severity),
-					CalculatedBySeverity: true,
-					Severity:             strings.ToUpper(cont.Cvss3Severity),
-				},
-			})
+	for _, ctype := range append([]CveContentType{Debian, DebianSecurityTracker, Ubuntu, UbuntuAPI, Amazon, GitHub, WpScan}, GetCveContentTypes(string(Trivy))...) {
+		if conts, found := v.CveContents[ctype]; found {
+			for _, cont := range conts {
+				if cont.Cvss3Severity != "" {
+					switch ctype {
+					case DebianSecurityTracker: // Multiple Severities(sorted) may be listed, and the largest one is used.
+						ss := strings.Split(cont.Cvss3Severity, "|")
+						values = append(values, CveContentCvss{
+							Type: ctype,
+							Value: Cvss{
+								Type:                 CVSS3,
+								Score:                severityToCvssScoreRoughly(ss[len(ss)-1]),
+								CalculatedBySeverity: true,
+								Severity:             strings.ToUpper(cont.Cvss3Severity),
+							},
+						})
+					default:
+						values = append(values, CveContentCvss{
+							Type: ctype,
+							Value: Cvss{
+								Type:                 CVSS3,
+								Score:                severityToCvssScoreRoughly(cont.Cvss3Severity),
+								CalculatedBySeverity: true,
+								Severity:             strings.ToUpper(cont.Cvss3Severity),
+							},
+						})
+					}
+				}
+			}
 		}
 	}
 
-	// Memo: Only RedHat, Oracle and Amazon has severity data in advisory.
+	// Memo: Only RedHat, SUSE, Oracle and Amazon has severity data in advisory.
 	for _, adv := range v.DistroAdvisories {
 		if adv.Severity != "" {
 			score := severityToCvssScoreRoughly(adv.Severity)
@@ -442,9 +605,38 @@ func (v VulnInfo) Cvss3Scores() (values []CveContentCvss) {
 	return
 }
 
+// Cvss40Scores returns CVSS V4 Score
+func (v VulnInfo) Cvss40Scores() (values []CveContentCvss) {
+	for _, ctype := range []CveContentType{Paloalto, Mitre, Nvd, Vulncheck, Euvd} {
+		if conts, found := v.CveContents[ctype]; found {
+			for _, cont := range conts {
+				if cont.Cvss40Score == 0 && cont.Cvss40Severity == "" {
+					continue
+				}
+				// https://nvd.nist.gov/vuln-metrics/cvss
+				values = append(values, CveContentCvss{
+					Type:   ctype,
+					Source: cont.Optional["source"],
+					Value: Cvss{
+						Type:     CVSS40,
+						Score:    cont.Cvss40Score,
+						Vector:   cont.Cvss40Vector,
+						Severity: strings.ToUpper(cont.Cvss40Severity),
+					},
+				})
+			}
+		}
+	}
+	return
+}
+
 // MaxCvssScore returns max CVSS Score
 // If there is no CVSS Score, return Severity as a numerical value.
 func (v VulnInfo) MaxCvssScore() CveContentCvss {
+	v40Max := v.MaxCvss40Score()
+	if v40Max.Type != Unknown {
+		return v40Max
+	}
 	v3Max := v.MaxCvss3Score()
 	if v3Max.Type != Unknown {
 		return v3Max
@@ -452,54 +644,69 @@ func (v VulnInfo) MaxCvssScore() CveContentCvss {
 	return v.MaxCvss2Score()
 }
 
+// MaxCvss40Score returns Max CVSS V4.0 Score
+func (v VulnInfo) MaxCvss40Score() CveContentCvss {
+	maxCvss := CveContentCvss{
+		Type:  Unknown,
+		Value: Cvss{Type: CVSS40},
+	}
+	for _, cvss := range v.Cvss40Scores() {
+		if maxCvss.Value.Score < cvss.Value.Score {
+			maxCvss = cvss
+		}
+	}
+	return maxCvss
+}
+
 // MaxCvss3Score returns Max CVSS V3 Score
 func (v VulnInfo) MaxCvss3Score() CveContentCvss {
-	max := CveContentCvss{
+	maxCvss := CveContentCvss{
 		Type:  Unknown,
 		Value: Cvss{Type: CVSS3},
 	}
 	for _, cvss := range v.Cvss3Scores() {
-		if max.Value.Score < cvss.Value.Score {
-			max = cvss
+		if maxCvss.Value.Score < cvss.Value.Score {
+			maxCvss = cvss
 		}
 	}
-	return max
+	return maxCvss
 }
 
 // MaxCvss2Score returns Max CVSS V2 Score
 func (v VulnInfo) MaxCvss2Score() CveContentCvss {
-	max := CveContentCvss{
+	maxCvss := CveContentCvss{
 		Type:  Unknown,
 		Value: Cvss{Type: CVSS2},
 	}
 	for _, cvss := range v.Cvss2Scores() {
-		if max.Value.Score < cvss.Value.Score {
-			max = cvss
+		if maxCvss.Value.Score < cvss.Value.Score {
+			maxCvss = cvss
 		}
 	}
-	return max
+	return maxCvss
 }
 
 // AttackVector returns attack vector string
 func (v VulnInfo) AttackVector() string {
-	for _, cnt := range v.CveContents {
-		if strings.HasPrefix(cnt.Cvss2Vector, "AV:N") ||
-			strings.Contains(cnt.Cvss3Vector, "AV:N") {
-			return "AV:N"
-		} else if strings.HasPrefix(cnt.Cvss2Vector, "AV:A") ||
-			strings.Contains(cnt.Cvss3Vector, "AV:A") {
-			return "AV:A"
-		} else if strings.HasPrefix(cnt.Cvss2Vector, "AV:L") ||
-			strings.Contains(cnt.Cvss3Vector, "AV:L") {
-			return "AV:L"
-		} else if strings.Contains(cnt.Cvss3Vector, "AV:P") {
-			// no AV:P in CVSS v2
-			return "AV:P"
+	for _, conts := range v.CveContents {
+		for _, cont := range conts {
+			switch {
+			case strings.HasPrefix(cont.Cvss2Vector, "AV:N") || strings.Contains(cont.Cvss3Vector, "AV:N") || strings.Contains(cont.Cvss40Vector, "AV:N"):
+				return "AV:N"
+			case strings.HasPrefix(cont.Cvss2Vector, "AV:A") || strings.Contains(cont.Cvss3Vector, "AV:A") || strings.Contains(cont.Cvss40Vector, "AV:A"):
+				return "AV:A"
+			case strings.HasPrefix(cont.Cvss2Vector, "AV:L") || strings.Contains(cont.Cvss3Vector, "AV:L") || strings.Contains(cont.Cvss40Vector, "AV:L"):
+				return "AV:L"
+			case strings.Contains(cont.Cvss3Vector, "AV:P") || strings.Contains(cont.Cvss40Vector, "AV:P"): // no AV:P in CVSS v2
+				return "AV:P"
+			}
 		}
 	}
-	if cont, found := v.CveContents[DebianSecurityTracker]; found {
-		if attackRange, found := cont.Optional["attack range"]; found {
-			return attackRange
+	if conts, found := v.CveContents[DebianSecurityTracker]; found {
+		for _, cont := range conts {
+			if attackRange, found := cont.Optional["attack range"]; found {
+				return attackRange
+			}
 		}
 	}
 	return ""
@@ -507,10 +714,25 @@ func (v VulnInfo) AttackVector() string {
 
 // PatchStatus returns fixed or unfixed string
 func (v VulnInfo) PatchStatus(packs Packages) string {
-	// Vuls don't know patch status of the CPE
-	if len(v.CpeURIs) != 0 {
-		return ""
+	if slices.Contains(v.Confidences, WindowsRoughMatch) {
+		return "unknown"
 	}
+
+	if slices.Contains(v.Confidences, WindowsUpdateSearch) {
+		if slices.ContainsFunc(v.AffectedPackages, func(e PackageFixStatus) bool { return e.FixState == "unknown" }) {
+			return "unknown"
+		}
+		if slices.ContainsFunc(v.AffectedPackages, func(e PackageFixStatus) bool { return e.FixState == "unfixed" }) || (len(v.AffectedPackages) == 0 && len(v.WindowsKBFixedIns) == 0) {
+			return "unfixed"
+		}
+		return "fixed"
+	}
+
+	// Vuls don't know patch status of the CPE
+	if len(v.CpeURIs) > 0 {
+		return "unknown"
+	}
+
 	for _, p := range v.AffectedPackages {
 		if p.NotFixedYet {
 			return "unfixed"
@@ -530,13 +752,28 @@ func (v VulnInfo) PatchStatus(packs Packages) string {
 			}
 		}
 	}
+
 	return "fixed"
 }
 
 // CveContentCvss has CVSS information
 type CveContentCvss struct {
-	Type  CveContentType `json:"type"`
-	Value Cvss           `json:"value"`
+	Type   CveContentType `json:"type"`
+	Source string         `json:"source,omitempty"`
+	Value  Cvss           `json:"value"`
+}
+
+// Label returns the content type, qualified by the per-source label when the
+// CveContent carries one (e.g. "nvd(nvd@nist.gov)"). One source can publish
+// several metric sets for a CVE — NVD and VulnCheck report both the CNA's and
+// their own, MITRE one per CNA/ADP container — and each becomes its own
+// CveContent, so reports need the source to tell the rows apart. Type alone
+// stays usable as a CveContents key.
+func (c CveContentCvss) Label() string {
+	if c.Source == "" {
+		return string(c.Type)
+	}
+	return fmt.Sprintf("%s(%s)", c.Type, c.Source)
 }
 
 // CvssType Represent the type of CVSS
@@ -548,6 +785,9 @@ const (
 
 	// CVSS3 means CVSS version3
 	CVSS3 CvssType = "3"
+
+	// CVSS40 means CVSS version4.0
+	CVSS40 CvssType = "4.0"
 )
 
 // Cvss has CVSS Score
@@ -580,7 +820,7 @@ func severityToCvssScoreRange(severity string) string {
 		return "7.0-8.9"
 	case "MODERATE", "MEDIUM":
 		return "4.0-6.9"
-	case "LOW":
+	case "LOW", "NEGLIGIBLE":
 		return "0.1-3.9"
 	}
 	return "None"
@@ -598,6 +838,10 @@ func severityToCvssScoreRange(severity string) string {
 // Critical, High, Medium, Low
 // https://wiki.ubuntu.com/Bugs/Importance
 // https://people.canonical.com/~ubuntu-security/cve/priority.html
+//
+// Ubuntu CVE Tracker
+// Critical, High, Medium, Low, Negligible
+// https://people.canonical.com/~ubuntu-security/priority.html
 func severityToCvssScoreRoughly(severity string) float64 {
 	switch strings.ToUpper(severity) {
 	case "CRITICAL":
@@ -606,7 +850,7 @@ func severityToCvssScoreRoughly(severity string) float64 {
 		return 8.9
 	case "MODERATE", "MEDIUM":
 		return 6.9
-	case "LOW":
+	case "LOW", "NEGLIGIBLE":
 		return 3.9
 	}
 	return 0
@@ -614,11 +858,20 @@ func severityToCvssScoreRoughly(severity string) float64 {
 
 // FormatMaxCvssScore returns Max CVSS Score
 func (v VulnInfo) FormatMaxCvssScore() string {
-	max := v.MaxCvssScore()
+	cvss := v.MaxCvssScore()
+	// Not Label(): the type is already parenthesised here, so the source is
+	// listed alongside it rather than nested in a second pair of parens.
+	if cvss.Source != "" {
+		return fmt.Sprintf("%3.1f %s (%s, %s)",
+			cvss.Value.Score,
+			strings.ToUpper(cvss.Value.Severity),
+			cvss.Type,
+			cvss.Source)
+	}
 	return fmt.Sprintf("%3.1f %s (%s)",
-		max.Value.Score,
-		strings.ToUpper(max.Value.Severity),
-		max.Type)
+		cvss.Value.Score,
+		strings.ToUpper(cvss.Value.Severity),
+		cvss.Type)
 }
 
 // DistroAdvisories is a list of DistroAdvisory
@@ -658,15 +911,51 @@ func (p DistroAdvisory) Format() string {
 	return strings.Join(buf, "\n")
 }
 
+// ExploitType represents the source type of an exploit
+type ExploitType string
+
+const (
+	// ExploitTypeExploitDB is the source type for Offensive Security Exploit DB.
+	ExploitTypeExploitDB ExploitType = "OffensiveSecurity"
+	// ExploitTypeGitHub is the source type for GitHub PoC-in-GitHub.
+	ExploitTypeGitHub ExploitType = "GitHub"
+	// ExploitTypeInTheWild is the source type for inthewild.io.
+	ExploitTypeInTheWild ExploitType = "InTheWild"
+	// ExploitTypeTrickest is the source type for Trickest.
+	ExploitTypeTrickest ExploitType = "Trickest"
+	// ExploitTypeNuclei is the source type for Nuclei templates.
+	ExploitTypeNuclei ExploitType = "Nuclei"
+	// ExploitTypeNVD is the source type for NVD.
+	ExploitTypeNVD ExploitType = "nvd"
+)
+
 // Exploit :
 type Exploit struct {
-	ExploitType  exploitmodels.ExploitType `json:"exploitType"`
-	ID           string                    `json:"id"`
-	URL          string                    `json:"url"`
-	Description  string                    `json:"description"`
-	DocumentURL  *string                   `json:"documentURL,omitempty"`
-	ShellCodeURL *string                   `json:"shellCodeURL,omitempty"`
-	BinaryURL    *string                   `json:"binaryURL,omitempty"`
+	ExploitType  ExploitType `json:"exploitType"`
+	ID           string      `json:"id"`
+	URL          string      `json:"url"`
+	Description  string      `json:"description"`
+	Verified     *bool       `json:"verified,omitempty"`
+	DocumentURL  *string     `json:"documentURL,omitempty"`
+	ShellCodeURL *string     `json:"shellCodeURL,omitempty"`
+	BinaryURL    *string     `json:"binaryURL,omitempty"`
+	PaperURL     *string     `json:"paperURL,omitempty"`
+	GHDBURL      *string     `json:"ghdbURL,omitempty"`
+}
+
+// Exploits is a list of Exploit
+type Exploits []Exploit
+
+// AppendIfMissing appends exploit to the list if missing. Identity is the
+// natural key (ExploitType, URL, ID); entries differing only in enrichment
+// payload (Description, pointer fields) are considered the same exploit.
+func (es *Exploits) AppendIfMissing(exploit Exploit) {
+	for _, e := range *es {
+		if e.ExploitType == exploit.ExploitType && e.URL == exploit.URL && e.ID == exploit.ID {
+			return
+		}
+	}
+	*es = append(*es, exploit)
 }
 
 // Metasploit :
@@ -684,22 +973,102 @@ type Mitigation struct {
 	URL            string         `json:"url,omitempty"`
 }
 
+// Mitigations is a list of Mitigation
+type Mitigations []Mitigation
+
+// AppendIfMissing appends mitigation to the list if missing. Identity is the
+// natural key (CveContentType, URL, Mitigation).
+func (ms *Mitigations) AppendIfMissing(mitigation Mitigation) {
+	for _, m := range *ms {
+		if m.CveContentType == mitigation.CveContentType && m.URL == mitigation.URL && m.Mitigation == mitigation.Mitigation {
+			return
+		}
+	}
+	*ms = append(*ms, mitigation)
+}
+
+// KEVType :
+type KEVType string
+
+const (
+	// CISAKEVType is CISA KEV
+	CISAKEVType KEVType = "cisa"
+	// VulnCheckKEVType is VulnCheck KEV
+	VulnCheckKEVType KEVType = "vulncheck"
+	// ENISAKEVType is ENISA KEV
+	ENISAKEVType KEVType = "enisa"
+)
+
+// KEV has CISA, VulnCheck, or ENISA Known Exploited Vulnerability
+type KEV struct {
+	Type                       KEVType    `json:"type,omitempty"`
+	VendorProject              string     `json:"vendor_project,omitempty"`
+	Product                    string     `json:"product,omitempty"`
+	VulnerabilityName          string     `json:"vulnerability_name,omitempty"`
+	ShortDescription           string     `json:"short_description,omitempty"`
+	RequiredAction             string     `json:"required_action,omitempty"`
+	KnownRansomwareCampaignUse string     `json:"known_ransomware_campaign_use,omitempty"`
+	DateAdded                  time.Time  `json:"date_added,omitzero"`
+	DueDate                    *time.Time `json:"due_date,omitempty"`
+
+	CISA      *CISAKEV      `json:"cisa,omitempty"`
+	VulnCheck *VulnCheckKEV `json:"vulncheck,omitempty"`
+	ENISA     *ENISAKEV     `json:"enisa,omitempty"`
+}
+
+// CISAKEV has CISA KEV only data
+type CISAKEV struct {
+	Note string `json:"note,omitempty"`
+}
+
+// VulnCheckKEV has VulnCheck KEV only data
+type VulnCheckKEV struct {
+	XDB                  []VulnCheckXDB                  `json:"xdb,omitempty"`
+	ReportedExploitation []VulnCheckReportedExploitation `json:"reported_exploitation,omitempty"`
+}
+
+// VulnCheckXDB :
+type VulnCheckXDB struct {
+	XDBID       string    `json:"xdb_id,omitempty"`
+	XDBURL      string    `json:"xdb_url,omitempty"`
+	DateAdded   time.Time `json:"date_added,omitzero"`
+	ExploitType string    `json:"exploit_type,omitempty"`
+	CloneSSHURL string    `json:"clone_ssh_url,omitempty"`
+}
+
+// VulnCheckReportedExploitation :
+type VulnCheckReportedExploitation struct {
+	URL       string    `json:"url,omitempty"`
+	DateAdded time.Time `json:"date_added,omitzero"`
+}
+
+// ENISAKEV has ENISA KEV only data
+type ENISAKEV struct {
+	DateReported           time.Time `json:"date_reported,omitzero"`
+	PatchedSince           string    `json:"patched_since,omitempty"`
+	OriginSource           string    `json:"origin_source,omitempty"`
+	ExploitationType       string    `json:"exploitation_type,omitempty"`
+	ThreatActorsExploiting string    `json:"threat_actors_exploiting,omitempty"`
+}
+
 // AlertDict has target cve JPCERT and USCERT alert data
 type AlertDict struct {
-	Ja []Alert `json:"ja"`
-	En []Alert `json:"en"`
+	CISA   []Alert `json:"cisa"` // backwards compatibility: for CISA KEV in old JSON
+	JPCERT []Alert `json:"jpcert"`
+	USCERT []Alert `json:"uscert"`
+}
+
+// IsEmpty checks if the content of AlertDict is empty
+func (a AlertDict) IsEmpty() bool {
+	return len(a.JPCERT) == 0 && len(a.USCERT) == 0
 }
 
 // FormatSource returns which source has this alert
 func (a AlertDict) FormatSource() string {
-	s := []string{}
-	if len(a.En) != 0 {
-		s = append(s, "USCERT")
+	if len(a.USCERT) != 0 || len(a.JPCERT) != 0 {
+		return "CERT"
 	}
-	if len(a.Ja) != 0 {
-		s = append(s, "JPCERT")
-	}
-	return strings.Join(s, "/")
+	return ""
 }
 
 // Confidences is a list of Confidence
@@ -717,8 +1086,8 @@ func (cs *Confidences) AppendIfMissing(confidence Confidence) {
 
 // SortByConfident sorts Confidences
 func (cs Confidences) SortByConfident() Confidences {
-	sort.Slice(cs, func(i, j int) bool {
-		return cs[i].SortOrder < cs[j].SortOrder
+	slices.SortFunc(cs, func(a, b Confidence) int {
+		return cmp.Compare(a.SortOrder, b.SortOrder)
 	})
 	return cs
 }
@@ -741,77 +1110,207 @@ func (c Confidence) String() string {
 type DetectionMethod string
 
 const (
-	// CpeNameMatchStr is a String representation of CpeNameMatch
-	CpeNameMatchStr = "CpeNameMatch"
+	// NvdExactVersionMatchStr :
+	NvdExactVersionMatchStr = "NvdExactVersionMatch"
 
-	// YumUpdateSecurityMatchStr is a String representation of YumUpdateSecurityMatch
-	YumUpdateSecurityMatchStr = "YumUpdateSecurityMatch"
+	// NvdRoughVersionMatchStr :
+	NvdRoughVersionMatchStr = "NvdRoughVersionMatch"
 
-	// PkgAuditMatchStr is a String representation of PkgAuditMatch
+	// NvdVendorProductMatchStr :
+	NvdVendorProductMatchStr = "NvdVendorProductMatch"
+
+	// VulncheckExactVersionMatchStr :
+	VulncheckExactVersionMatchStr = "VulncheckExactVersionMatch"
+
+	// VulncheckRoughVersionMatchStr :
+	VulncheckRoughVersionMatchStr = "VulncheckRoughVersionMatch"
+
+	// VulncheckVendorProductMatchStr :
+	VulncheckVendorProductMatchStr = "VulncheckVendorProductMatch"
+
+	// JvnVendorProductMatchStr :
+	JvnVendorProductMatchStr = "JvnVendorProductMatch"
+
+	// FortinetExactVersionMatchStr :
+	FortinetExactVersionMatchStr = "FortinetExactVersionMatch"
+
+	// FortinetRoughVersionMatchStr :
+	FortinetRoughVersionMatchStr = "FortinetRoughVersionMatch"
+
+	// FortinetVendorProductMatchStr :
+	FortinetVendorProductMatchStr = "FortinetVendorProductMatch"
+
+	// PaloaltoExactVersionMatchStr :
+	PaloaltoExactVersionMatchStr = "PaloaltoExactVersionMatch"
+
+	// PaloaltoRoughVersionMatchStr :
+	PaloaltoRoughVersionMatchStr = "PaloaltoRoughVersionMatch"
+
+	// PaloaltoVendorProductMatchStr :
+	PaloaltoVendorProductMatchStr = "PaloaltoVendorProductMatch"
+
+	// CiscoExactVersionMatchStr :
+	CiscoExactVersionMatchStr = "CiscoExactVersionMatch"
+
+	// CiscoRoughVersionMatchStr :
+	CiscoRoughVersionMatchStr = "CiscoRoughVersionMatch"
+
+	// CiscoVendorProductMatchStr :
+	CiscoVendorProductMatchStr = "CiscoVendorProductMatch"
+
+	// AppleExactVersionMatchStr :
+	AppleExactVersionMatchStr = "AppleExactVersionMatch"
+
+	// AppleVendorProductMatchStr :
+	AppleVendorProductMatchStr = "AppleVendorProductMatch"
+	// OpenSSHExactVersionMatchStr :
+	OpenSSHExactVersionMatchStr = "OpenSSHExactVersionMatch"
+
+	// OpenSSHVendorProductMatchStr :
+	OpenSSHVendorProductMatchStr = "OpenSSHVendorProductMatch"
+
+	// PkgAuditMatchStr :
 	PkgAuditMatchStr = "PkgAuditMatch"
 
-	// OvalMatchStr is a String representation of OvalMatch
+	// OvalMatchStr :
 	OvalMatchStr = "OvalMatch"
 
-	// RedHatAPIStr is a String representation of RedHatAPIMatch
+	// RedHatAPIStr is :
 	RedHatAPIStr = "RedHatAPIMatch"
 
-	// DebianSecurityTrackerMatchStr is a String representation of DebianSecurityTrackerMatch
+	// DebianSecurityTrackerMatchStr :
 	DebianSecurityTrackerMatchStr = "DebianSecurityTrackerMatch"
 
-	// TrivyMatchStr is a String representation of Trivy
+	// UbuntuAPIMatchStr :
+	UbuntuAPIMatchStr = "UbuntuAPIMatch"
+
+	// WindowsUpdateSearchStr :
+	WindowsUpdateSearchStr = "WindowsUpdateSearch"
+
+	// WindowsRoughMatchStr :
+	WindowsRoughMatchStr = "WindowsRoughMatch"
+
+	// OracleSolarisAdvisoryMatchStr :
+	OracleSolarisAdvisoryMatchStr = "OracleSolarisAdvisoryMatch"
+
+	// TrivyMatchStr :
 	TrivyMatchStr = "TrivyMatch"
 
-	// ChangelogExactMatchStr is a String representation of ChangelogExactMatch
+	// ChangelogExactMatchStr :
 	ChangelogExactMatchStr = "ChangelogExactMatch"
 
-	// ChangelogLenientMatchStr is a String representation of ChangelogLenientMatch
-	ChangelogLenientMatchStr = "ChangelogLenientMatch"
+	// ChangelogRoughMatchStr :
+	ChangelogRoughMatchStr = "ChangelogRoughMatch"
 
-	// GitHubMatchStr is a String representation of GitHubMatch
+	// GitHubMatchStr :
 	GitHubMatchStr = "GitHubMatch"
 
-	// WpScanMatchStr is a String representation of WordPress VulnDB scanning
+	// WpScanMatchStr :
 	WpScanMatchStr = "WpScanMatch"
 
-	// FailedToGetChangelog is a String representation of FailedToGetChangelog
+	// FailedToGetChangelog :
 	FailedToGetChangelog = "FailedToGetChangelog"
 
-	// FailedToFindVersionInChangelog is a String representation of FailedToFindVersionInChangelog
+	// FailedToFindVersionInChangelog :
 	FailedToFindVersionInChangelog = "FailedToFindVersionInChangelog"
 )
 
 var (
-	// CpeNameMatch is a ranking how confident the CVE-ID was detected correctly
-	CpeNameMatch = Confidence{100, CpeNameMatchStr, 1}
-
-	// YumUpdateSecurityMatch is a ranking how confident the CVE-ID was detected correctly
-	YumUpdateSecurityMatch = Confidence{100, YumUpdateSecurityMatchStr, 2}
-
 	// PkgAuditMatch is a ranking how confident the CVE-ID was detected correctly
 	PkgAuditMatch = Confidence{100, PkgAuditMatchStr, 2}
 
 	// OvalMatch is a ranking how confident the CVE-ID was detected correctly
 	OvalMatch = Confidence{100, OvalMatchStr, 0}
 
-	// RedHatAPIMatch ranking how confident the CVE-ID was detected correctly
+	// RedHatAPIMatch is a ranking how confident the CVE-ID was detected correctly
 	RedHatAPIMatch = Confidence{100, RedHatAPIStr, 0}
 
-	// DebianSecurityTrackerMatch ranking how confident the CVE-ID was detected correctly
+	// DebianSecurityTrackerMatch is a ranking how confident the CVE-ID was detected correctly
 	DebianSecurityTrackerMatch = Confidence{100, DebianSecurityTrackerMatchStr, 0}
 
-	// TrivyMatch ranking how confident the CVE-ID was detected correctly
+	// UbuntuAPIMatch is a ranking how confident the CVE-ID was detected correctly
+	UbuntuAPIMatch = Confidence{100, UbuntuAPIMatchStr, 0}
+
+	// WindowsUpdateSearch is a ranking how confident the CVE-ID was detected correctly
+	WindowsUpdateSearch = Confidence{100, WindowsUpdateSearchStr, 0}
+
+	// WindowsRoughMatch is a ranking how confident the CVE-ID was detected correctly
+	WindowsRoughMatch = Confidence{30, WindowsRoughMatchStr, 0}
+
+	// OracleSolarisAdvisoryMatch is a ranking how confident the CVE-ID was detected correctly
+	OracleSolarisAdvisoryMatch = Confidence{100, OracleSolarisAdvisoryMatchStr, 0}
+
+	// TrivyMatch is a ranking how confident the CVE-ID was detected correctly
 	TrivyMatch = Confidence{100, TrivyMatchStr, 0}
 
 	// ChangelogExactMatch is a ranking how confident the CVE-ID was detected correctly
 	ChangelogExactMatch = Confidence{95, ChangelogExactMatchStr, 3}
 
-	// ChangelogLenientMatch is a ranking how confident the CVE-ID was detected correctly
-	ChangelogLenientMatch = Confidence{50, ChangelogLenientMatchStr, 4}
+	// ChangelogRoughMatch is a ranking how confident the CVE-ID was detected correctly
+	ChangelogRoughMatch = Confidence{50, ChangelogRoughMatchStr, 4}
 
 	// GitHubMatch is a ranking how confident the CVE-ID was detected correctly
-	GitHubMatch = Confidence{97, GitHubMatchStr, 2}
+	GitHubMatch = Confidence{100, GitHubMatchStr, 2}
 
 	// WpScanMatch is a ranking how confident the CVE-ID was detected correctly
 	WpScanMatch = Confidence{100, WpScanMatchStr, 0}
+
+	// NvdExactVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	NvdExactVersionMatch = Confidence{100, NvdExactVersionMatchStr, 1}
+
+	// NvdRoughVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	NvdRoughVersionMatch = Confidence{80, NvdRoughVersionMatchStr, 1}
+
+	// NvdVendorProductMatch is a ranking how confident the CVE-ID was detected correctly
+	NvdVendorProductMatch = Confidence{10, NvdVendorProductMatchStr, 9}
+
+	// VulncheckExactVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	VulncheckExactVersionMatch = Confidence{85, VulncheckExactVersionMatchStr, 2}
+
+	// VulncheckRoughVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	VulncheckRoughVersionMatch = Confidence{65, VulncheckRoughVersionMatchStr, 2}
+
+	// VulncheckVendorProductMatch is a ranking how confident the CVE-ID was detected correctly
+	VulncheckVendorProductMatch = Confidence{10, VulncheckVendorProductMatchStr, 9}
+
+	// JvnVendorProductMatch is a ranking how confident the CVE-ID was detected correctly
+	JvnVendorProductMatch = Confidence{10, JvnVendorProductMatchStr, 10}
+
+	// FortinetExactVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	FortinetExactVersionMatch = Confidence{100, FortinetExactVersionMatchStr, 1}
+
+	// FortinetRoughVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	FortinetRoughVersionMatch = Confidence{80, FortinetRoughVersionMatchStr, 1}
+
+	// FortinetVendorProductMatch is a ranking how confident the CVE-ID was detected correctly
+	FortinetVendorProductMatch = Confidence{10, FortinetVendorProductMatchStr, 9}
+
+	// PaloaltoExactVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	PaloaltoExactVersionMatch = Confidence{100, PaloaltoExactVersionMatchStr, 1}
+
+	// PaloaltoRoughVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	PaloaltoRoughVersionMatch = Confidence{80, PaloaltoRoughVersionMatchStr, 1}
+
+	// PaloaltoVendorProductMatch is a ranking how confident the CVE-ID was detected correctly
+	PaloaltoVendorProductMatch = Confidence{10, PaloaltoVendorProductMatchStr, 9}
+
+	// CiscoExactVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	CiscoExactVersionMatch = Confidence{100, CiscoExactVersionMatchStr, 1}
+
+	// CiscoRoughVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	CiscoRoughVersionMatch = Confidence{80, CiscoRoughVersionMatchStr, 1}
+
+	// CiscoVendorProductMatch is a ranking how confident the CVE-ID was detected correctly
+	CiscoVendorProductMatch = Confidence{10, CiscoVendorProductMatchStr, 9}
+
+	// AppleExactVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	AppleExactVersionMatch = Confidence{100, AppleExactVersionMatchStr, 1}
+
+	// AppleVendorProductMatch is a ranking how confident the CVE-ID was detected correctly
+	AppleVendorProductMatch = Confidence{10, AppleVendorProductMatchStr, 9}
+	// OpenSSHExactVersionMatch is a ranking how confident the CVE-ID was detected correctly
+	OpenSSHExactVersionMatch = Confidence{100, OpenSSHExactVersionMatchStr, 1}
+
+	// OpenSSHVendorProductMatch is a ranking how confident the CVE-ID was detected correctly
+	OpenSSHVendorProductMatch = Confidence{10, OpenSSHVendorProductMatchStr, 9}
 )

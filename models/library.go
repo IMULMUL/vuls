@@ -1,28 +1,19 @@
 package models
 
 import (
-	"path/filepath"
-
-	"github.com/aquasecurity/trivy-db/pkg/db"
-	trivyDBTypes "github.com/aquasecurity/trivy-db/pkg/types"
-	"github.com/aquasecurity/trivy/pkg/detector/library"
-
-	"github.com/aquasecurity/trivy/pkg/types"
-	"github.com/future-architect/vuls/util"
-	"golang.org/x/xerrors"
-	// "github.com/aquasecurity/go-dep-parser/pkg/types"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
 )
 
 // LibraryScanners is an array of LibraryScanner
 type LibraryScanners []LibraryScanner
 
 // Find : find by name
-func (lss LibraryScanners) Find(path, name string) map[string]types.Library {
-	filtered := map[string]types.Library{}
+func (lss LibraryScanners) Find(path, name string) map[string]Library {
+	filtered := map[string]Library{}
 	for _, ls := range lss {
 		for _, lib := range ls.Libs {
-			if ls.Path == path && lib.Name == name {
-				filtered[ls.Path] = lib
+			if ls.LockfilePath == path && lib.Name == name {
+				filtered[ls.LockfilePath] = lib
 				break
 			}
 		}
@@ -40,106 +31,113 @@ func (lss LibraryScanners) Total() (total int) {
 
 // LibraryScanner has libraries information
 type LibraryScanner struct {
-	Path string
-	Libs []types.Library
+	Type ftypes.LangType
+	Libs []Library
+
+	// The path to the Lockfile is stored.
+	LockfilePath string `json:"path,omitempty"`
 }
 
-// Scan : scan target library
-func (s LibraryScanner) Scan() ([]VulnInfo, error) {
-	scanner, err := library.DriverFactory{}.NewDriver(filepath.Base(string(s.Path)))
-	if err != nil {
-		return nil, xerrors.Errorf("Failed to new a library driver: %w", err)
-	}
-	var vulnerabilities = []VulnInfo{}
-	for _, pkg := range s.Libs {
-		tvulns, err := scanner.Detect(pkg.Name, pkg.Version)
-		if err != nil {
-			return nil, xerrors.Errorf("failed to detect %s vulnerabilities: %w", scanner.Type(), err)
-		}
-		if len(tvulns) == 0 {
-			continue
-		}
+// Library holds the attribute of a package library
+type Library struct {
+	Name    string
+	Version string
+	PURL    string
 
-		vulns := s.convertFanalToVuln(tvulns)
-		vulnerabilities = append(vulnerabilities, vulns...)
-	}
+	// The Path to the library in the container image. Empty string when Lockfile scan.
+	// This field is used to convert the result JSON of a `trivy image` using trivy-to-vuls.
+	FilePath string
+	Digest   string
 
-	return vulnerabilities, nil
+	// Dev indicates whether the library is a development dependency.
+	Dev bool
+
+	// ID is the Trivy Package.ID used as the key when resolving DependsOn.
+	// It is typically formatted as "<name>@<version>" but may be empty for some
+	// language parsers that do not populate package IDs.
+	ID string `json:",omitempty"`
+
+	// Relationship indicates the dependency kind: "direct", "indirect", "workspace",
+	// "root", or "unknown". Mirrors the stringified form of Trivy fanal types Relationship.
+	//
+	// Note: some Trivy parsers (e.g. the npm parser) are non-deterministic for
+	// packages reachable through multiple paths, so the resulting "direct"/"indirect"
+	// label can flip between runs. ID and DependsOn are stable (ID is parser-assigned,
+	// DependsOn is keyed by ID), so callers that need a deterministic dependency
+	// graph should rely on ID + DependsOn rather than Relationship.
+	Relationship string `json:",omitempty"`
+
+	// DependsOn lists the Package.ID values that this library directly depends on.
+	// Combined with ID, it allows callers to reconstruct the full dependency graph
+	// emitted by Trivy.
+	DependsOn []string `json:",omitempty"`
 }
 
-func (s LibraryScanner) convertFanalToVuln(tvulns []types.DetectedVulnerability) (vulns []VulnInfo) {
-	for _, tvuln := range tvulns {
-		vinfo, err := s.getVulnDetail(tvuln)
-		if err != nil {
-			util.Log.Debugf("failed to getVulnDetail. err: %s, tvuln: %#v", err, tvuln)
-			continue
-		}
-		vulns = append(vulns, vinfo)
-	}
-	return vulns
-}
-
-func (s LibraryScanner) getVulnDetail(tvuln types.DetectedVulnerability) (vinfo VulnInfo, err error) {
-	vul, err := db.Config{}.GetVulnerability(tvuln.VulnerabilityID)
-	if err != nil {
-		return vinfo, err
-	}
-
-	vinfo.CveID = tvuln.VulnerabilityID
-	vinfo.CveContents = getCveContents(tvuln.VulnerabilityID, vul)
-	if tvuln.FixedVersion != "" {
-		vinfo.LibraryFixedIns = []LibraryFixedIn{
-			{
-				Key:     s.GetLibraryKey(),
-				Name:    tvuln.PkgName,
-				FixedIn: tvuln.FixedVersion,
-				Path:    s.Path,
-			},
-		}
-	}
-	return vinfo, nil
-}
-
-func getCveContents(cveID string, vul trivyDBTypes.Vulnerability) (contents map[CveContentType]CveContent) {
-	contents = map[CveContentType]CveContent{}
-	refs := []Reference{}
-	for _, refURL := range vul.References {
-		refs = append(refs, Reference{Source: "trivy", Link: refURL})
-	}
-
-	content := CveContent{
-		Type:          Trivy,
-		CveID:         cveID,
-		Title:         vul.Title,
-		Summary:       vul.Description,
-		Cvss3Severity: string(vul.Severity),
-		References:    refs,
-	}
-	contents[Trivy] = content
-	return contents
-}
-
-// LibraryMap is filename and library type
-var LibraryMap = map[string]string{
-	"package-lock.json": "node",
-	"yarn.lock":         "node",
-	"Gemfile.lock":      "ruby",
-	"Cargo.lock":        "rust",
-	"composer.lock":     "php",
-	"Pipfile.lock":      "python",
-	"poetry.lock":       "python",
+// FindLockFiles is a list of filenames that is the target of findLock
+var FindLockFiles = []string{
+	// dart/pub
+	ftypes.PubSpecLock,
+	// elixir/mix
+	ftypes.MixLock,
+	// node
+	ftypes.NpmPkgLock, ftypes.YarnLock, ftypes.PnpmLock, ftypes.BunLock,
+	// ruby
+	ftypes.GemfileLock, "*.gemspec",
+	// rust
+	ftypes.CargoLock,
+	// php
+	ftypes.ComposerLock, ftypes.ComposerInstalledJson,
+	// python
+	ftypes.PipRequirements, ftypes.PipfileLock, ftypes.PoetryLock, ftypes.PyLockFile, "pylock.*.toml", ftypes.UvLock,
+	// .net
+	ftypes.NuGetPkgsLock, ftypes.NuGetPkgsConfig, "*.deps.json", "*Packages.props",
+	// gomod
+	ftypes.GoMod, ftypes.GoSum,
+	// java
+	ftypes.MavenPom, "*.jar", "*.war", "*.ear", "*.par", "*gradle.lockfile",
+	// C / C++
+	ftypes.ConanLock,
+	// Swift
+	ftypes.CocoaPodsLock, ftypes.SwiftResolved,
 }
 
 // GetLibraryKey returns target library key
 func (s LibraryScanner) GetLibraryKey() string {
-	fileName := filepath.Base(s.Path)
-	return LibraryMap[fileName]
+	switch s.Type {
+	case ftypes.Bundler, ftypes.GemSpec:
+		return "ruby"
+	case ftypes.Cargo, ftypes.RustBinary:
+		return "rust"
+	case ftypes.Composer, ftypes.ComposerVendor:
+		return "php"
+	case ftypes.GoBinary, ftypes.GoModule:
+		return "gomod"
+	case ftypes.Jar, ftypes.Pom, ftypes.Gradle:
+		return "java"
+	case ftypes.Npm, ftypes.Yarn, ftypes.Pnpm, ftypes.NodePkg, ftypes.JavaScript, ftypes.Bun:
+		return "node"
+	case ftypes.NuGet, ftypes.DotNetCore:
+		return ".net"
+	case ftypes.Pip, ftypes.Pipenv, ftypes.Poetry, ftypes.PyLock, ftypes.PythonPkg, ftypes.Uv:
+		return "python"
+	case ftypes.Conan:
+		return "c"
+	case ftypes.Pub:
+		return "dart"
+	case ftypes.Hex:
+		return "elixir"
+	case ftypes.Swift, ftypes.Cocoapods:
+		return "swift"
+	default:
+		return ""
+	}
 }
 
 // LibraryFixedIn has library fixed information
 type LibraryFixedIn struct {
 	Key     string `json:"key,omitempty"`
 	Name    string `json:"name,omitempty"`
+	Version string `json:"version,omitempty"`
 	FixedIn string `json:"fixedIn,omitempty"`
 	Path    string `json:"path,omitempty"`
 }

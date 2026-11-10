@@ -1,12 +1,21 @@
 package config
 
 import (
+	"fmt"
+	"maps"
+	"net"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/c-robinson/iplib"
 	"github.com/knqyf263/go-cpe/naming"
 	"golang.org/x/xerrors"
+
+	"github.com/future-architect/vuls/constant"
+	"github.com/future-architect/vuls/logging"
 )
 
 // TOMLLoader loads config
@@ -14,32 +23,41 @@ type TOMLLoader struct {
 }
 
 // Load load the configuration TOML file specified by path arg.
-func (c TOMLLoader) Load(pathToToml, keyPass string) error {
-	if _, err := toml.DecodeFile(pathToToml, &Conf); err != nil {
+func (c TOMLLoader) Load(pathToToml string) error {
+	// util.Log.Infof("Loading config: %s", pathToToml)
+	if _, err := toml.DecodeFile(pathToToml, &ConfV1); err != nil {
 		return err
 	}
-	if keyPass != "" {
-		Conf.Default.KeyPassword = keyPass
+	if ConfV1.Version != "v2" && runtime.GOOS == "windows" {
+		logging.Log.Infof("An outdated version of config.toml was detected. Converting to newer version...")
+		if err := convertToLatestConfig(pathToToml); err != nil {
+			return xerrors.Errorf("Failed to convert to latest config. err: %w", err)
+		}
+	} else if _, err := toml.DecodeFile(pathToToml, &Conf); err != nil {
+		return err
 	}
 
-	Conf.CveDict.Init()
-	Conf.OvalDict.Init()
-	Conf.Gost.Init()
-	Conf.Exploit.Init()
-	Conf.Metasploit.Init()
-
 	index := 0
+	servers := map[string]ServerInfo{}
 	for name, server := range Conf.Servers {
-		server.ServerName = name
-		if 0 < len(server.KeyPassword) {
-			return xerrors.Errorf("[Deprecated] KEYPASSWORD IN CONFIG FILE ARE UNSECURE. REMOVE THEM IMMEDIATELY FOR A SECURITY REASONS. THEY WILL BE REMOVED IN A FUTURE RELEASE: %s", name)
+		server.BaseName = name
+
+		if server.Type != constant.ServerTypePseudo && server.Host == "" {
+			return xerrors.New("Failed to find hosts. err: server.host is empty")
+		}
+		serverHosts, err := hosts(server.Host, server.IgnoreIPAddresses)
+		if err != nil {
+			return xerrors.Errorf("Failed to find hosts. err: %w", err)
+		}
+		if len(serverHosts) == 0 {
+			return xerrors.New("Failed to find hosts. err: zero enumerated hosts")
 		}
 
-		if err := setDefaultIfEmpty(&server, Conf.Default); err != nil {
+		if err := setDefaultIfEmpty(&server); err != nil {
 			return xerrors.Errorf("Failed to set default value to config. server: %s, err: %w", name, err)
 		}
 
-		if err := setScanMode(&server, Conf.Default); err != nil {
+		if err := setScanMode(&server); err != nil {
 			return xerrors.Errorf("Failed to set ScanMode: %w", err)
 		}
 
@@ -59,26 +77,14 @@ func (c TOMLLoader) Load(pathToToml, keyPass string) error {
 		}
 
 		for _, cve := range Conf.Default.IgnoreCves {
-			found := false
-			for _, c := range server.IgnoreCves {
-				if cve == c {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(server.IgnoreCves, cve)
 			if !found {
 				server.IgnoreCves = append(server.IgnoreCves, cve)
 			}
 		}
 
 		for _, pkg := range Conf.Default.IgnorePkgsRegexp {
-			found := false
-			for _, p := range server.IgnorePkgsRegexp {
-				if pkg == p {
-					found = true
-					break
-				}
-			}
+			found := slices.Contains(server.IgnorePkgsRegexp, pkg)
 			if !found {
 				server.IgnorePkgsRegexp = append(server.IgnorePkgsRegexp, pkg)
 			}
@@ -93,70 +99,128 @@ func (c TOMLLoader) Load(pathToToml, keyPass string) error {
 			for _, reg := range cont.IgnorePkgsRegexp {
 				_, err := regexp.Compile(reg)
 				if err != nil {
-					return xerrors.Errorf("Failed to parse %s in %s@%s. err: %w",
-						reg, contName, name, err)
+					return xerrors.Errorf("Failed to parse %s in %s@%s. err: %w", reg, contName, name, err)
 				}
-			}
-		}
-
-		for ownerRepo, githubSetting := range server.GitHubRepos {
-			if ss := strings.Split(ownerRepo, "/"); len(ss) != 2 {
-				return xerrors.Errorf("Failed to parse GitHub owner/repo: %s in %s",
-					ownerRepo, name)
-			}
-			if githubSetting.Token == "" {
-				return xerrors.Errorf("GitHub owner/repo: %s in %s token is empty",
-					ownerRepo, name)
 			}
 		}
 
 		if len(server.Enablerepo) == 0 {
 			server.Enablerepo = Conf.Default.Enablerepo
 		}
-		if len(server.Enablerepo) != 0 {
-			for _, repo := range server.Enablerepo {
-				switch repo {
-				case "base", "updates":
-					// nop
-				default:
-					return xerrors.Errorf(
-						"For now, enablerepo have to be base or updates: %s",
-						server.Enablerepo)
-				}
+		for _, repo := range server.Enablerepo {
+			switch repo {
+			case "base", "updates":
+				// nop
+			default:
+				return xerrors.Errorf("For now, enablerepo have to be base or updates: %s", server.Enablerepo)
 			}
 		}
 
-		server.LogMsgAnsiColor = Colors[index%len(Colors)]
-		index++
+		if len(server.Disablerepo) == 0 {
+			server.Disablerepo = Conf.Default.Disablerepo
+		}
 
-		Conf.Servers[name] = server
+		if server.PortScan.ScannerBinPath != "" {
+			server.PortScan.IsUseExternalScanner = true
+		}
+
+		if !isCIDRNotation(server.Host) {
+			server.ServerName = name
+			servers[server.ServerName] = server
+			continue
+		}
+		for _, host := range serverHosts {
+			server.Host = host
+			server.ServerName = fmt.Sprintf("%s(%s)", name, host)
+			server.LogMsgAnsiColor = Colors[index%len(Colors)]
+			index++
+			servers[server.ServerName] = server
+		}
 	}
+	Conf.Servers = servers
+
 	return nil
 }
 
-func setDefaultIfEmpty(server *ServerInfo, d ServerInfo) error {
-	if server.Type != ServerTypePseudo {
-		if len(server.Host) == 0 {
-			return xerrors.Errorf("server.host is empty")
-		}
+func hosts(host string, ignores []string) ([]string, error) {
+	hostMap := map[string]struct{}{}
+	hosts, err := enumerateHosts(host)
+	if err != nil {
+		return nil, xerrors.Errorf("Failed to enumarate hosts. err: %w", err)
+	}
+	for _, host := range hosts {
+		hostMap[host] = struct{}{}
+	}
 
+	for _, ignore := range ignores {
+		hosts, err := enumerateHosts(ignore)
+		if err != nil {
+			return nil, xerrors.Errorf("Failed to enumarate hosts. err: %w", err)
+		}
+		if len(hosts) == 1 && net.ParseIP(hosts[0]) == nil {
+			return nil, xerrors.Errorf("Failed to ignore hosts. err: a non-IP address has been entered in ignoreIPAddress")
+		}
+		for _, host := range hosts {
+			delete(hostMap, host)
+		}
+	}
+
+	hosts = []string{}
+	for host := range hostMap {
+		hosts = append(hosts, host)
+	}
+	return hosts, nil
+}
+
+func enumerateHosts(host string) ([]string, error) {
+	if !isCIDRNotation(host) {
+		return []string{host}, nil
+	}
+
+	ipAddr, ipNet, err := net.ParseCIDR(host)
+	if err != nil {
+		return nil, xerrors.Errorf("Failed to parse CIDR. err: %w", err)
+	}
+	maskLen, _ := ipNet.Mask.Size()
+
+	addrs := []string{}
+	if net.ParseIP(ipAddr.String()).To4() != nil {
+		n := iplib.NewNet4(ipAddr, int(maskLen))
+		for _, addr := range n.Enumerate(int(n.Count()), 0) {
+			addrs = append(addrs, addr.String())
+		}
+	} else if net.ParseIP(ipAddr.String()).To16() != nil {
+		n := iplib.NewNet6(ipAddr, int(maskLen), 0)
+		if !n.Count().IsInt64() {
+			return nil, xerrors.Errorf("Failed to enumerate IP address. err: mask bitsize too big")
+		}
+		for _, addr := range n.Enumerate(int(n.Count().Int64()), 0) {
+			addrs = append(addrs, addr.String())
+		}
+	}
+	return addrs, nil
+}
+
+func isCIDRNotation(host string) bool {
+	ss := strings.Split(host, "/")
+	if len(ss) == 1 || net.ParseIP(ss[0]) == nil {
+		return false
+	}
+	return true
+}
+
+func setDefaultIfEmpty(server *ServerInfo) error {
+	if server.Type != constant.ServerTypePseudo {
 		if len(server.JumpServer) == 0 {
 			server.JumpServer = Conf.Default.JumpServer
 		}
 
 		if server.Port == "" {
-			if Conf.Default.Port != "" {
-				server.Port = Conf.Default.Port
-			} else {
-				server.Port = "22"
-			}
+			server.Port = Conf.Default.Port
 		}
 
 		if server.User == "" {
 			server.User = Conf.Default.User
-			if server.User == "" && server.Port != "local" {
-				return xerrors.Errorf("server.user is empty")
-			}
 		}
 
 		if server.SSHConfigPath == "" {
@@ -165,10 +229,6 @@ func setDefaultIfEmpty(server *ServerInfo, d ServerInfo) error {
 
 		if server.KeyPath == "" {
 			server.KeyPath = Conf.Default.KeyPath
-		}
-
-		if server.KeyPassword == "" {
-			server.KeyPassword = Conf.Default.KeyPassword
 		}
 	}
 
@@ -208,17 +268,27 @@ func setDefaultIfEmpty(server *ServerInfo, d ServerInfo) error {
 		}
 	}
 
+	if server.PortScan == nil {
+		server.PortScan = Conf.Default.PortScan
+		if server.PortScan == nil {
+			server.PortScan = &PortScanConf{}
+		}
+	}
+
+	if server.Windows == nil {
+		server.Windows = Conf.Default.Windows
+		if server.Windows == nil {
+			server.Windows = &WindowsConf{}
+		}
+	}
+
 	if len(server.IgnoredJSONKeys) == 0 {
 		server.IgnoredJSONKeys = Conf.Default.IgnoredJSONKeys
 	}
 
-	opt := map[string]interface{}{}
-	for k, v := range Conf.Default.Optional {
-		opt[k] = v
-	}
-	for k, v := range server.Optional {
-		opt[k] = v
-	}
+	opt := map[string]any{}
+	maps.Copy(opt, Conf.Default.Optional)
+	maps.Copy(opt, server.Optional)
 	server.Optional = opt
 
 	return nil

@@ -2,8 +2,9 @@ package parser
 
 import (
 	"encoding/xml"
-	"io/ioutil"
+	"io"
 	"os"
+	"slices"
 	"strings"
 
 	"github.com/knqyf263/go-cpe/naming"
@@ -24,10 +25,8 @@ type vulnerabilityID struct {
 }
 
 func appendIfMissing(slice []string, str string) []string {
-	for _, s := range slice {
-		if s == str {
-			return slice
-		}
+	if slices.Contains(slice, str) {
+		return slice
 	}
 	return append(slice, str)
 }
@@ -41,7 +40,7 @@ func Parse(path string) ([]string, error) {
 	}
 	defer file.Close()
 
-	b, err := ioutil.ReadAll(file)
+	b, err := io.ReadAll(file)
 	if err != nil {
 		log.Warnf("Failed to read OWASP Dependency Check XML: %s", path)
 		return []string{}, nil

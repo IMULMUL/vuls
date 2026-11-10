@@ -1,0 +1,2373 @@
+package vuls2
+
+import (
+	"cmp"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"iter"
+	"maps"
+	"net/url"
+	"path"
+	"regexp"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"golang.org/x/xerrors"
+
+	attackTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/attack"
+	kindTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/attack/kind"
+	capecTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/capec"
+	cweTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/cwe"
+	dataTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data"
+	criteriaTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria"
+	criterionTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion"
+	vcAffectedRangeTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion/versioncriterion/affected/range"
+	vcFixStatusTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion/versioncriterion/fixstatus"
+	vcPackageTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion/versioncriterion/package"
+	segmentTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/segment"
+	ecosystemTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/segment/ecosystem"
+	severityTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity"
+	v2 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v2"
+	v31 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v31"
+	v40 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v40"
+	severityVendorTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/vendor"
+	vulnerabilityContentTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/vulnerability/content"
+	sourceTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/source"
+	"github.com/MaineK00n/vuls2/pkg/db/session"
+	dbTypes "github.com/MaineK00n/vuls2/pkg/db/session/types"
+	"github.com/MaineK00n/vuls2/pkg/detect/cpe"
+	"github.com/MaineK00n/vuls2/pkg/detect/ospkg"
+	detectTypes "github.com/MaineK00n/vuls2/pkg/detect/types"
+	scanTypes "github.com/MaineK00n/vuls2/pkg/scan/types"
+	"github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/constant"
+	"github.com/future-architect/vuls/cwe"
+	"github.com/future-architect/vuls/logging"
+	"github.com/future-architect/vuls/models"
+	"github.com/knqyf263/go-cpe/naming"
+)
+
+// defaultRegistory is GitHub Container Registry for vuls2 db
+const defaultRegistory = "ghcr.io/vulsio/vuls-nightly-db"
+
+// DetectPkgs detects OS-package / Microsoft-KB vulnerabilities using the
+// vuls2 database and fills ScanResult.ScannedCves. CPE-URI detection lives
+// in DetectCPEs so the two paths (detector.DetectPkgCves for packages,
+// detector.DetectCpeURIsCves for CPEs) can run separately without
+// double-detecting packages.
+//
+// sesh is the db session to query, created with NewSession and owned (Closed)
+// by the caller.
+func DetectPkgs(r *models.ScanResult, sesh *Session) error {
+	return detectWith(r, preConvertPkgs(r), nil, nil, sesh)
+}
+
+// CPE is one scanned CPE to detect (a CPE 2.2 URI or 2.3 FS string), paired
+// with whether its matches may consult JVN. UseJVN:false suppresses JVN-source
+// matches for this CPE — mirroring the former go-cve-dictionary UseJVN flag —
+// so e.g. the Apple CPEs synthesised for macOS (MacOSCPEs) do not surface
+// JVN-only detections, while user-supplied CPEs (UseJVN:true) do.
+type CPE struct {
+	URI    string
+	UseJVN bool
+}
+
+// DetectCPEs detects vulnerabilities for the given CPEs (CPE 2.2 URI or
+// 2.3 FS form — typically ScanResult.Config.Scan.Servers[...].CpeNames) using
+// the vuls2 database. OS-package / Microsoft-KB detection is suppressed here:
+// it already ran via DetectPkgs (detector.DetectPkgCves), and running it
+// twice would duplicate AffectedPackages on merge.
+//
+// sesh is the db session to query, created with NewSession and owned (Closed)
+// by the caller.
+func DetectCPEs(r *models.ScanResult, cpes []CPE, sesh *Session) error {
+	if len(cpes) == 0 {
+		return nil
+	}
+	vuls2Scanned, fsToOriginalCPE, noJVNCPEs, err := preConvertCPEs(r, cpes)
+	if err != nil {
+		return xerrors.Errorf("Failed to convert CPEs. err: %w", err)
+	}
+	return detectWith(r, vuls2Scanned, fsToOriginalCPE, noJVNCPEs, sesh)
+}
+
+// Session is a lazily-opened, shared vuls2 db handle scoped to one server's
+// detection and enrichment. The db is opened at most once — on the first path
+// that actually queries it — and reused by every later path, so the read cache
+// that OS-package / CPE detection warms is still warm for the enrichment that
+// immediately follows instead of being discarded and rebuilt. It is opened
+// only when some path genuinely needs it, exactly as the unshared code did:
+// a family that skips vuls2 detection (FreeBSD, pseudo, trivy-scanned, ...)
+// does not open it during detection, but enrichment still opens it when the
+// result carries CVEs (e.g. FreeBSD's pkg-audit findings); a server with
+// nothing to detect and no CVEs to enrich never opens it at all. Create one
+// with NewSession, thread it through DetectPkgs / DetectCPEs /
+// EnrichVulnInfos, and Close it when the server is done. It is not safe for
+// concurrent use; one server's detection runs sequentially, which is the
+// intended scope.
+type Session struct {
+	vuls2Conf  config.Vuls2Conf
+	noProgress bool
+
+	sesh *session.Session
+}
+
+// NewSession returns a not-yet-opened shared Session; the db is opened lazily
+// on the first path that queries it (see Session).
+func NewSession(vuls2Conf config.Vuls2Conf, noProgress bool) *Session {
+	return &Session{vuls2Conf: vuls2Conf, noProgress: noProgress}
+}
+
+// open opens the db on the first call and reuses the connection on every later
+// one, so all paths sharing this Session query the same db. A nil Session is
+// rejected rather than dereferenced, so a caller that forgot to create one gets
+// an error instead of a panic. A failed open is not cached: the first caller
+// propagates the error and the detection run aborts before any other path would
+// reach open again.
+func (s *Session) open() (*session.Session, error) {
+	if s == nil {
+		return nil, xerrors.Errorf("db session is nil; create one with NewSession")
+	}
+	if s.sesh == nil {
+		sesh, err := openSession(s.vuls2Conf, s.noProgress)
+		if err != nil {
+			return nil, xerrors.Errorf("Failed to open db session. err: %w", err)
+		}
+		s.sesh = sesh
+	}
+	return s.sesh, nil
+}
+
+// Close releases the db storage and cache if this Session was opened. It is a
+// no-op on a nil or never-opened Session, and clears the handle afterwards so a
+// second Close (or a stray open) neither double-closes nor reuses a closed
+// session — always safe to defer.
+func (s *Session) Close() {
+	if s == nil || s.sesh == nil {
+		return
+	}
+	_ = s.sesh.Storage().Close()
+	s.sesh.Cache().Close()
+	s.sesh = nil
+}
+
+// openSession opens a cache-backed vuls2 db session: it fills in the default
+// repository/path, downloads or refreshes the db if due and validates the
+// schema version (both inside newDBConfig), opens storage, and records the db
+// digest on the global config. The caller owns the returned session and must
+// close its Storage() and Cache().
+func openSession(vuls2Conf config.Vuls2Conf, noProgress bool) (*session.Session, error) {
+	if vuls2Conf.Repository == "" {
+		sv, err := session.SchemaVersion("boltdb")
+		if err != nil {
+			return nil, xerrors.Errorf("Failed to get schema version. err: %w", err)
+		}
+
+		vuls2Conf.Repository = fmt.Sprintf("%s:%d", defaultRegistory, sv)
+	}
+	if vuls2Conf.Path == "" {
+		vuls2Conf.Path = DefaultPath
+	}
+
+	dbConfig, err := newDBConfig(vuls2Conf, noProgress)
+	if err != nil {
+		return nil, xerrors.Errorf("Failed to get new db connection. err: %w", err)
+	}
+
+	sesh, err := dbConfig.New()
+	if err != nil {
+		return nil, xerrors.Errorf("Failed to new db session. err: %w", err)
+	}
+
+	if err := sesh.Storage().Open(); err != nil {
+		sesh.Cache().Close()
+		return nil, xerrors.Errorf("Failed to open db. err: %w", err)
+	}
+
+	metadata, err := sesh.Storage().GetMetadata()
+	if err != nil {
+		_ = sesh.Storage().Close()
+		sesh.Cache().Close()
+		return nil, xerrors.Errorf("Failed to get metadata. err: %w", err)
+	}
+	if metadata == nil {
+		_ = sesh.Storage().Close()
+		sesh.Cache().Close()
+		return nil, xerrors.Errorf("unexpected vuls2 db metadata. metadata: nil, path: %s", vuls2Conf.Path)
+	}
+	config.Conf.Vuls2.Digest = metadata.Digest
+
+	return sesh, nil
+}
+
+func detectWith(r *models.ScanResult, vuls2Scanned scanTypes.ScanResult, fsToOriginalCPE map[string][]string, noJVNCPEs map[string]struct{}, shared *Session) error {
+	sesh, err := shared.open()
+	if err != nil {
+		return xerrors.Errorf("Failed to open db session. err: %w", err)
+	}
+
+	vuls2Detected, warnEntries, err := detect(sesh, vuls2Scanned)
+	if err != nil {
+		return xerrors.Errorf("Failed to detect. err: %w", err)
+	}
+
+	vulnInfos, err := postConvert(vuls2Scanned, vuls2Detected, fsToOriginalCPE, noJVNCPEs)
+	if err != nil {
+		return xerrors.Errorf("Failed to post convert. err: %w", err)
+	}
+
+	mergeIntoScannedCves(r, vulnInfos)
+
+	// Surface the skips vuls2 recorded as scan-result warnings, deduplicated
+	// against warnings already registered by the other vuls2 pass:
+	// DetectPkgs and DetectCPEs both route through here. detect harvests
+	// the warnings while streaming, before the trees are reduced — the
+	// reduced result no longer carries them. They are rendered here, where
+	// fsToOriginalCPE is at hand to quote a CPE as the caller supplied it.
+	for _, msg := range renderWarningEntries(warnEntries, fsToOriginalCPE) {
+		if !slices.Contains(r.Warnings, msg) {
+			r.Warnings = append(r.Warnings, msg)
+		}
+	}
+
+	// detectWith runs once per entry point (DetectPkgs, DetectCPEs); name
+	// the pass so the two log lines of one report run stay tellable apart.
+	logging.Log.Infof("%s: %d CVEs are detected with vuls2 (%s)", r.FormatServerName(), len(vulnInfos), func() string {
+		if len(vuls2Scanned.CPE) > 0 {
+			return "cpe"
+		}
+		return "os packages"
+	}())
+
+	return nil
+}
+
+// mergeIntoScannedCves merges vuls2-detected VulnInfos into the scan
+// result's ScannedCves. A new CVE is registered as-is; for a CVE that is
+// already present (registered by the other vuls2 pass, by the
+// go-cve-dictionary pass, or carried in a caller-provided result), every
+// field the vuls2 postConvert produces is merged — the remaining VulnInfo
+// fields are owned by enrichment / other detectors and never appear in
+// vuls2 output.
+//
+// Not to be confused with mergeVulnInfo, which merges WITHIN one vuls2 run:
+// this function merges ACROSS passes and sources, so the existing entry may
+// not come from vuls2 at all. It therefore assumes nothing about
+// vuls2-internal markers (no Optional["vuls2-sources"]), only dedup-appends
+// (never picks a winner between conflicting contents), and also carries the
+// aggregate fields mergeVulnInfo does not handle (AffectedPackages,
+// CpeURIs, WindowsKBFixedIns — postConvert fills those after its own merge).
+func mergeIntoScannedCves(r *models.ScanResult, vulnInfos models.VulnInfos) {
+	// A caller-provided result may carry a nil ScannedCves map (e.g. a
+	// zero-value ScanResult from a library consumer); initialize before
+	// writing into it.
+	if r.ScannedCves == nil {
+		r.ScannedCves = models.VulnInfos{}
+	}
+
+	for cveID, vi := range vulnInfos {
+		viBase, found := r.ScannedCves[cveID]
+		if !found {
+			viBase = vi
+		} else {
+			// Store() keeps one row per package name (last write wins), so a
+			// base already carrying package statuses — a caller-provided
+			// ScannedCves, or a prior detection pass — does not accumulate
+			// duplicate/contradictory rows for the same package.
+			for _, p := range vi.AffectedPackages {
+				viBase.AffectedPackages = viBase.AffectedPackages.Store(p)
+			}
+			// WindowsKBFixedIns merges like the other per-path outputs: a
+			// CVE first registered by the CPE pass (or already present in
+			// the input ScannedCves) would otherwise lose the KB numbers
+			// the package/KB pass detected.
+			for _, kb := range vi.WindowsKBFixedIns {
+				if !slices.Contains(viBase.WindowsKBFixedIns, kb) {
+					viBase.WindowsKBFixedIns = append(viBase.WindowsKBFixedIns, kb)
+				}
+			}
+			for _, da := range vi.DistroAdvisories {
+				viBase.DistroAdvisories.AppendIfMissing(&da)
+			}
+			for _, c := range vi.Confidences {
+				viBase.Confidences.AppendIfMissing(c)
+			}
+			// A pre-existing VulnInfo may carry a nil CveContents map (e.g.
+			// unmarshaled from a result JSON where cveContents was omitted);
+			// initialize before writing into it.
+			if viBase.CveContents == nil {
+				viBase.CveContents = models.CveContents{}
+			}
+			// A CVE can be detected by both vuls2 entry points (DetectPkgs
+			// for OS packages, DetectCPEs for CPE URIs); those two passes
+			// never produce the same CveContents type (distro types vs cpe
+			// types), so they cannot collide with each other. A caller-provided
+			// base (or the go-cve-dictionary pass) may already carry the same
+			// type for this CVE, though — vuls2 now emits Nvd/Jvn contents — so
+			// dedup on the (type, CVE, source link, CVSS/CWE source) identity
+			// before appending, mirroring the key-based dedup the sibling
+			// merges above use, to avoid repeating a source/link in reports.
+			// The CVSS/CWE source belongs in that identity because the
+			// per-source contents of one type (nvd's own analysis and the
+			// CNA's) share a source link, and keying on the link alone would
+			// drop all but the first. Reconciling genuinely conflicting
+			// contents of one source (e.g. differing CVSS) is out of scope: the
+			// existing entry is kept.
+			for ccType, ccs := range vi.CveContents {
+				for _, cc := range ccs {
+					if slices.ContainsFunc(viBase.CveContents[ccType], func(e models.CveContent) bool {
+						return e.Type == cc.Type && e.CveID == cc.CveID && e.SourceLink == cc.SourceLink && e.Optional["source"] == cc.Optional["source"]
+					}) {
+						continue
+					}
+					viBase.CveContents[ccType] = append(viBase.CveContents[ccType], cc)
+				}
+			}
+			// CpeURIs must merge too: a CVE first registered by the package
+			// path would otherwise end up with an empty CpeURIs even though
+			// the CPE pass matched it against the configured CPE list.
+			// Dedup on append: the two vuls2 passes cannot both produce
+			// CpeURIs, but the go-cve-dictionary pass may already have
+			// registered the same user-supplied CPE on the same CVE (a CVE
+			// covered by both NVD and a vendor advisory source).
+			for _, uri := range vi.CpeURIs {
+				if !slices.Contains(viBase.CpeURIs, uri) {
+					viBase.CpeURIs = append(viBase.CpeURIs, uri)
+				}
+			}
+			// Exploits / Mitigations must merge too: a CVE registered first
+			// by the go-cve-dictionary non-NVD path would otherwise silently
+			// drop the vuls2-derived entries.
+			for _, e := range vi.Exploits {
+				viBase.Exploits.AppendIfMissing(e)
+			}
+			for _, m := range vi.Mitigations {
+				viBase.Mitigations.AppendIfMissing(m)
+			}
+		}
+		r.ScannedCves[cveID] = viBase
+	}
+}
+
+// EnrichVulnInfos enriches all ScannedCves in the ScanResult with additional vulnerability data
+// (e.g., Red Hat API) from the vuls2 database.
+// This should be called after all detection paths have completed.
+//
+// shared is the db session to query, created with NewSession and owned (Closed)
+// by the caller.
+func EnrichVulnInfos(r *models.ScanResult, shared *Session) error {
+	if len(r.ScannedCves) == 0 {
+		return nil
+	}
+
+	sesh, err := shared.open()
+	if err != nil {
+		return xerrors.Errorf("Failed to open db session. err: %w", err)
+	}
+
+	if err := enrich(sesh, r.ScannedCves); err != nil {
+		return xerrors.Errorf("Failed to enrich vulnerability data. err: %w", err)
+	}
+
+	if err := enrichCTI(sesh, r); err != nil {
+		return xerrors.Errorf("Failed to enrich CTI. err: %w", err)
+	}
+
+	return nil
+}
+
+// preConvertBase builds the vuls2-shape ScanResult fields shared by both
+// detection inputs (server identity, family/release mapping, kernel).
+func preConvertBase(sr *models.ScanResult) scanTypes.ScanResult {
+	return scanTypes.ScanResult{
+		JSONVersion: 0,
+		ServerName:  sr.ServerName,
+		Family:      ecosystemTypes.Ecosystem(toVuls2Family(sr.Family, sr.Release)),
+		Release:     toVuls2Release(sr.Family, sr.Release),
+
+		Kernel: scanTypes.Kernel{
+			Release:        sr.RunningKernel.Release,
+			Version:        sr.RunningKernel.Version,
+			RebootRequired: sr.RunningKernel.RebootRequired,
+		},
+
+		ScannedAt: sr.ScannedAt,
+		ScannedBy: sr.ScannedBy,
+	}
+}
+
+// preConvertPkgs builds the vuls2-shape ScanResult carrying the OS-package /
+// Microsoft-KB inputs for DetectPkgs. The CPE list stays empty — CPE
+// detection is DetectCPEs' job (see preConvertCPEs).
+func preConvertPkgs(sr *models.ScanResult) scanTypes.ScanResult {
+	pkgs := make(map[string]scanTypes.OSPackage)
+	for _, p := range sr.SrcPackages {
+		if sr.Family == constant.Raspbian && models.IsRaspbianPackage(p.Name, p.Version) {
+			continue
+		}
+		for _, bn := range p.BinaryNames {
+			pkgs[bn] = scanTypes.OSPackage{
+				SrcName:    p.Name,
+				SrcVersion: p.Version,
+			}
+		}
+	}
+	for _, p := range sr.Packages {
+		if sr.Family == constant.Raspbian && models.IsRaspbianPackage(p.Name, p.Version) {
+			continue
+		}
+		base := pkgs[p.Name]
+		base.Name = p.Name
+		base.Version = preConvertBinaryVersion(sr.Family, p.Version)
+		base.Release = p.Release
+		base.NewVersion = p.NewVersion
+		base.NewRelease = p.NewRelease
+		base.Arch = p.Arch
+		base.Repository = p.Repository
+		base.ModularityLabel = p.ModularityLabel
+		pkgs[p.Name] = base
+	}
+
+	scanned := preConvertBase(sr)
+	scanned.OSPackages = func() []scanTypes.OSPackage {
+		ps := slices.Collect(maps.Values(pkgs))
+		// For Windows, include the OS release as a synthetic package so that
+		// kernel-version-based detection can report the correct release name.
+		if sr.Family == constant.Windows && sr.RunningKernel.Version != "" {
+			ps = append(ps, scanTypes.OSPackage{
+				Name:    toVuls2Release(sr.Family, sr.Release),
+				Version: sr.RunningKernel.Version,
+			})
+		}
+		return ps
+	}()
+	if sr.WindowsKB != nil {
+		scanned.MicrosoftKB = scanTypes.MicrosoftKB{
+			Applied:   sr.WindowsKB.Applied,
+			Unapplied: sr.WindowsKB.Unapplied,
+		}
+	}
+	return scanned
+}
+
+// preConvertCPEs builds the vuls2-shape ScanResult carrying only the CPE
+// list for DetectCPEs — the OS-package / Microsoft-KB inputs stay empty so
+// detect() only exercises the CPE path; packages were already detected via
+// DetectPkgs, and converting them again would duplicate AffectedPackages on
+// merge.
+//
+// The CPE list is converted to the CPE 2.3 Formatted-String form vuls2
+// requires: vuls normalises config CPEs to CPE 2.2 URI, so most inputs go
+// through UnbindURI + BindToFS; entries already in FS form pass through, and
+// an unparseable entry fails the conversion — config-sourced CPEs were
+// already validated at config-load time, so it signals an unvalidated
+// caller input. The returned reverse map
+// (FS string -> user-supplied forms) is consumed by postConvert to restore
+// the user's input in VulnInfo.CpeURIs rather than leaking the internal
+// FS-with-wildcards representation.
+func preConvertCPEs(sr *models.ScanResult, cpes []CPE) (scanTypes.ScanResult, map[string][]string, map[string]struct{}, error) {
+	scanned := preConvertBase(sr)
+	if len(cpes) == 0 {
+		return scanned, nil, nil, nil
+	}
+
+	fsCPEs := make([]string, 0, len(cpes))
+	fsToOriginal := make(map[string][]string, len(cpes))
+	noJVNCPEs := make(map[string]struct{})
+	jvnCPEs := make(map[string]struct{})
+	for _, c := range cpes {
+		u := c.URI
+		var fs string
+		if strings.HasPrefix(u, "cpe:2.3:") {
+			// Validate FS-form inputs too (the URI branch validates via
+			// UnbindURI). Config-sourced CPEs were already validated at
+			// config-load time (toCpeURI), so a failure here means an
+			// unvalidated input — propagate it instead of silently
+			// detecting nothing for that CPE.
+			if _, err := naming.UnbindFS(u); err != nil {
+				return scanTypes.ScanResult{}, nil, nil, xerrors.Errorf("Failed to unbind CPE FS %q. err: %w", u, err)
+			}
+			fs = u
+		} else {
+			wfn, err := naming.UnbindURI(u)
+			if err != nil {
+				return scanTypes.ScanResult{}, nil, nil, xerrors.Errorf("Failed to unbind CPE URI %q. err: %w", u, err)
+			}
+			fs = naming.BindToFS(wfn)
+		}
+		// Dedup the DETECTION list by FS form — re-detecting the same FS
+		// string would only repeat work — but keep every distinct
+		// user-supplied form in the reverse map: the map exists to restore
+		// the user's input in VulnInfo.CpeURIs, and a user listing the same
+		// CPE in both URI and FS form expects both back (matching the
+		// classic per-input go-cve-dictionary behaviour).
+		if _, exists := fsToOriginal[fs]; !exists {
+			fsCPEs = append(fsCPEs, fs)
+		}
+		if !slices.Contains(fsToOriginal[fs], u) {
+			fsToOriginal[fs] = append(fsToOriginal[fs], u)
+		}
+		// Track the per-CPE UseJVN intent keyed by FS. A CPE listed with
+		// UseJVN:true anywhere keeps JVN; only a CPE that is exclusively
+		// UseJVN:false suppresses JVN-source matches (resolved below).
+		if c.UseJVN {
+			jvnCPEs[fs] = struct{}{}
+		} else {
+			noJVNCPEs[fs] = struct{}{}
+		}
+	}
+	for fs := range jvnCPEs {
+		delete(noJVNCPEs, fs)
+	}
+	if len(noJVNCPEs) == 0 {
+		noJVNCPEs = nil
+	}
+
+	scanned.CPE = fsCPEs
+	return scanned, fsToOriginal, noJVNCPEs, nil
+}
+
+// detect runs vuls2 detection over the scan result and assembles the
+// in-memory detectResult. It consumes the streaming Detect forms and
+// folds each rootID's detection as it arrives — harvesting the evaluation
+// warnings recorded on the full trees first, then projecting the trees to
+// what this package reads downstream (projectOSPkgDetection /
+// projectCPEDetection) — so peak memory holds the projected result plus
+// only the in-flight full trees. The second return value carries the
+// warning entries, which can no longer be derived from the (projected)
+// result; the caller renders them (renderWarningEntries).
+func detect(sesh *session.Session, sr scanTypes.ScanResult) (detectResult, []warningEntry, error) {
+	// The two entry points feed exclusive inputs: preConvertPkgs converts
+	// OS packages / Microsoft KB only, preConvertCPEs the CPE list only.
+	// Receiving both means a caller bypassed them.
+	if len(sr.CPE) > 0 && (len(sr.OSPackages) > 0 || len(sr.MicrosoftKB.Applied) > 0 || len(sr.MicrosoftKB.Unapplied) > 0) {
+		return detectResult{}, nil, xerrors.Errorf("ScanResult carries both CPE and OS-package / Microsoft-KB inputs; DetectPkgs and DetectCPEs feed them exclusively")
+	}
+
+	detections, warnEntries, err := func() (map[dataTypes.RootID]projectedDetection, []warningEntry, error) {
+		if len(sr.CPE) > 0 {
+			m, entries, err := foldDetectionSeq(cpe.Detect(sesh.Storage(), sr, runtime.NumCPU()), func(d detectTypes.VulnerabilityDataDetection) (projectedDetection, bool, error) {
+				projected, err := projectCPEDetection(d)
+				if err != nil {
+					return projectedDetection{}, false, err
+				}
+				return projected, true, nil
+			})
+			if err != nil {
+				return nil, nil, xerrors.Errorf("Failed to detect cpe. err: %w", err)
+			}
+			return m, entries, nil
+		}
+		// ospkg.Detect also covers Microsoft-KB detection, so gate on
+		// either input being present — a Windows scan can carry KBs
+		// without any OS packages.
+		if len(sr.OSPackages) > 0 || len(sr.MicrosoftKB.Applied) > 0 || len(sr.MicrosoftKB.Unapplied) > 0 {
+			m, entries, err := foldDetectionSeq(ospkg.Detect(sesh.Storage(), sr, runtime.NumCPU()), func(d detectTypes.VulnerabilityDataDetection) (projectedDetection, bool, error) {
+				projected, err := projectOSPkgDetection(d)
+				if err != nil {
+					return projectedDetection{}, false, err
+				}
+				// A rootID whose every condition pruned to empty carries no
+				// detection signal for any downstream consumer; dropping it
+				// here also skips its vulnerability-data fetch below.
+				return projected, len(projected.Contents) > 0, nil
+			})
+			if err != nil {
+				return nil, nil, xerrors.Errorf("Failed to detect os packages. err: %w", err)
+			}
+			return m, entries, nil
+		}
+		return nil, nil, nil
+	}()
+	if err != nil {
+		return detectResult{}, nil, xerrors.Errorf("Failed to detect. err: %w", err)
+	}
+
+	// Fetch Vulnerability/Advisory data narrowed to the detecting
+	// ecosystem / datasources, as master always did: pulling other
+	// ecosystems' or RootIDs' contents is EnrichVulnInfos' job, not
+	// detection's.
+	detected := make(map[dataTypes.RootID]vulnerabilityData, len(detections))
+	for rootID, d := range detections {
+		avs, err := sesh.GetVulnerabilityData(rootID, dbTypes.Filter{
+			Contents: []dbTypes.FilterContentType{
+				dbTypes.FilterContentTypeAdvisories,
+				dbTypes.FilterContentTypeVulnerabilities,
+			},
+			RootIDs:     []dataTypes.RootID{rootID},
+			Ecosystems:  []ecosystemTypes.Ecosystem{d.Ecosystem},
+			DataSources: slices.Collect(maps.Keys(d.Contents)),
+		})
+		if err != nil {
+			return detectResult{}, nil, xerrors.Errorf("Failed to get vulnerability data. RootID: %s, err: %w", rootID, err)
+		}
+		detected[rootID] = vulnerabilityData{
+			ID:              rootID,
+			Detections:      []projectedDetection{d},
+			Advisories:      avs.Advisories,
+			Vulnerabilities: avs.Vulnerabilities,
+		}
+	}
+
+	return detectResult{
+		Detected: slices.Collect(maps.Values(detected)),
+	}, warnEntries, nil
+}
+
+type source struct {
+	RootID   dataTypes.RootID     `json:"root_id,omitempty"`
+	SourceID sourceTypes.SourceID `json:"source_id,omitempty"`
+	Segment  segmentTypes.Segment `json:"segment,omitzero"`
+}
+
+type sourceData struct {
+	// detectableCveIDs whitelists which of this source's vulninfos
+	// postConvert may emit. vulninfos is content-driven — an advisory
+	// RootID carries every CVE under it, detected or not — and the pack
+	// aggregation picks ONE winning source per CVE/package via
+	// comparePack, so only the CVEs backed by a detection signal here
+	// (and, for packages, only on the winning source) are listed.
+	detectableCveIDs []string
+	vulninfos        models.VulnInfos
+	packStatuses     []packStatus
+	kbIDs            []string
+	// cpes holds the scanned CPEs this source's CPE conditions accepted, keyed
+	// by the VulnInfo ID they back (the CVE ID, or — for non-suppressed
+	// sources — the advisory ID of an advisory-only VulnInfo). It is the ONLY
+	// record of CPE matches, for every source, so every reader — the CpeURIs /
+	// detectable gating in postConvert and the confidence in toVuls0Confidence
+	// — looks a VulnInfo's matches up the same way and never has to know how
+	// the source was walked:
+	//   - suppressed sources (VulnCheck / JVN) are walked once per constituent
+	//     CVE with that CVE's own verified-product set, so a verified product
+	//     for one CVE never suppresses a sibling and the AND/OR criteria
+	//     satisfaction stays correct per CVE;
+	//   - every other source is walked once per root and the result is shared
+	//     by every ID the root reports (see reportIDsOf).
+	cpes map[string]cpeMatches
+}
+
+// cpeMatches is the scanned CPEs a source's CPE conditions accepted for one
+// VulnInfo, split into vuls0's two confidence tiers.
+type cpeMatches struct {
+	// exact holds scanned CPEs accepted at Exact quality (Accepts.CPE.Exact) —
+	// the version was confirmed. They are reported with the high
+	// ExactVersionMatch confidence.
+	exact []string
+	// vp holds scanned CPEs accepted only at VersionUnconfirmed quality
+	// (Accepts.CPE.VersionUnconfirmed) — the version could not be pinned (e.g.
+	// a version=NA criterion against a concrete query, or a version=NA query
+	// against a version-bearing criterion). They are reported with the low
+	// VendorProductMatch confidence instead of ExactVersionMatch — the vuls2
+	// replacement for go-cve-dictionary's fuzzy CPE reporting.
+	vp []string
+}
+
+type rootTag struct {
+	rootID dataTypes.RootID
+	tag    segmentTypes.DetectionTag
+}
+
+type pack struct {
+	ecosystem ecosystemTypes.Ecosystem
+	sourceID  sourceTypes.SourceID
+	rootTags  []rootTag
+
+	packStatus packStatus
+}
+
+type packStatus struct {
+	rangeType vcAffectedRangeTypes.RangeType
+	status    models.PackageFixStatus
+}
+
+// appendMissing appends each element of src to dst, skipping values already
+// present (order-preserving). The slice-wise companion to util.AppendIfMissing,
+// used to accumulate scanned-CPE / KB lists across conditions and sources.
+func appendMissing(dst, src []string) []string {
+	for _, s := range src {
+		if !slices.Contains(dst, s) {
+			dst = append(dst, s)
+		}
+	}
+	return dst
+}
+
+// postConvert assembles VulnInfos from the vuls2 detect result.
+//
+// fsToOriginalCPE maps each CPE 2.3 FS string in scanned.CPE back to the
+// user-supplied CPE form (URI or FS). It is consulted when building
+// VulnInfo.CpeURIs so the report shows the user-supplied CPE rather than
+// the internal FS-with-wildcards form. Nil / missing keys fall back to
+// the FS string as-is.
+func postConvert(scanned scanTypes.ScanResult, detected detectResult, fsToOriginalCPE map[string][]string, noJVNCPEs map[string]struct{}) (models.VulnInfos, error) {
+	m := make(map[source]sourceData)
+
+	// collectVerifiedProducts derives, per suppressed-source root, the products
+	// the verified sources define for each CVE; walkCPECriteria uses it to
+	// suppress VulnCheck / JVN matches already covered by a verified source.
+	if err := walkVulnerabilityDetections(m, scanned, detected.Detected, noJVNCPEs, collectVerifiedProducts(detected)); err != nil {
+		return nil, xerrors.Errorf("Failed to walk detections. err: %w", err)
+	}
+
+	if err := walkVulnerabilityDatas(m, detected.Detected); err != nil {
+		return nil, xerrors.Errorf("Failed to walk vulnerability data. err: %w", err)
+	}
+
+	type affected struct {
+		packm map[string]pack
+		kbIDs []string
+		cpes  cpeMatches
+	}
+
+	am := make(map[string]affected)
+	for src, vd := range m {
+		for _, vi := range vd.vulninfos {
+			base := am[vi.CveID]
+
+			if len(vd.packStatuses) > 0 {
+				if base.packm == nil {
+					base.packm = make(map[string]pack)
+				}
+				for _, status := range vd.packStatuses {
+					p, ok := base.packm[status.status.Name]
+					if ok {
+						result, err := comparePack(p, pack{
+							ecosystem: src.Segment.Ecosystem,
+							sourceID:  src.SourceID,
+							rootTags: []rootTag{{
+								rootID: src.RootID,
+								tag:    src.Segment.Tag,
+							}},
+							packStatus: packStatus{
+								rangeType: status.rangeType,
+								status:    status.status,
+							},
+						})
+						if err != nil {
+							return nil, xerrors.Errorf("Failed to compare pack. err: %w", err)
+						}
+						switch result {
+						case 0:
+							p.rootTags = append(p.rootTags, rootTag{
+								rootID: src.RootID,
+								tag:    src.Segment.Tag,
+							})
+						case -1:
+							p = pack{
+								ecosystem: src.Segment.Ecosystem,
+								sourceID:  src.SourceID,
+								rootTags: []rootTag{{
+									rootID: src.RootID,
+									tag:    src.Segment.Tag,
+								}},
+								packStatus: packStatus{
+									rangeType: status.rangeType,
+									status:    status.status,
+								},
+							}
+						default:
+						}
+					} else {
+						p = pack{
+							ecosystem: src.Segment.Ecosystem,
+							sourceID:  src.SourceID,
+							rootTags: []rootTag{{
+								rootID: src.RootID,
+								tag:    src.Segment.Tag,
+							}},
+							packStatus: packStatus{
+								rangeType: status.rangeType,
+								status:    status.status,
+							},
+						}
+					}
+					base.packm[status.status.Name] = p
+				}
+			}
+
+			cm := vd.cpes[vi.CveID]
+
+			base.kbIDs = appendMissing(base.kbIDs, vd.kbIDs)
+			base.cpes.exact = appendMissing(base.cpes.exact, cm.exact)
+			base.cpes.vp = appendMissing(base.cpes.vp, cm.vp)
+
+			// A KB/CPE detection signal marks this CVE emittable. packStatuses
+			// are deliberately excluded — packages are gated separately through
+			// comparePack's per-source winner selection.
+			if len(vd.kbIDs) > 0 || len(cm.exact) > 0 || len(cm.vp) > 0 {
+				if !slices.Contains(vd.detectableCveIDs, vi.CveID) {
+					vd.detectableCveIDs = append(vd.detectableCveIDs, vi.CveID)
+				}
+			}
+
+			am[vi.CveID] = base
+		}
+
+		m[src] = vd
+	}
+	for cveID, mm := range am {
+		for _, p := range mm.packm {
+			for _, tag := range p.rootTags {
+				src := source{
+					RootID:   tag.rootID,
+					SourceID: p.sourceID,
+					Segment: segmentTypes.Segment{
+						Ecosystem: p.ecosystem,
+						Tag:       tag.tag,
+					},
+				}
+				base := m[src]
+				if !slices.Contains(base.detectableCveIDs, cveID) {
+					base.detectableCveIDs = append(base.detectableCveIDs, cveID)
+				}
+				m[src] = base
+			}
+		}
+	}
+
+	vim := make(models.VulnInfos)
+	for _, vd := range m {
+		for _, vi := range vd.vulninfos {
+			if !slices.Contains(vd.detectableCveIDs, vi.CveID) {
+				continue
+			}
+
+			base, ok := vim[vi.CveID]
+			if ok {
+				merged, err := mergeVulnInfo(base, vi)
+				if err != nil {
+					return nil, xerrors.Errorf("Failed to merge vuln info. err: %w", err)
+				}
+				base = merged
+			} else {
+				base = vi
+			}
+			vim[vi.CveID] = base
+		}
+	}
+	for _, vi := range vim {
+		// Keep ps nil when there are no affected packages — skip the
+		// allocation and stay consistent with the in-memory convention that
+		// "not detected" is nil rather than an empty slice. (JSON output is
+		// unaffected either way: AffectedPackages carries omitempty.)
+		var ps models.PackageFixStatuses
+		if n := len(am[vi.CveID].packm); n > 0 {
+			ps = make(models.PackageFixStatuses, 0, n)
+			for _, p := range am[vi.CveID].packm {
+				ps = append(ps, p.packStatus.status)
+			}
+		}
+		if len(ps) > 0 {
+			vi.AffectedPackages = ps
+		}
+
+		// Restore the user-supplied CPE form (URI or FS) instead of
+		// leaking the matched FS-with-wildcards form. Unknown FS keys
+		// pass through verbatim (defensive — should not occur because
+		// walkCPECriteria sources cpes from scanned.CPE). Exact-match CPEs
+		// take precedence; the version-unconfirmed CPEs only fill CpeURIs
+		// when the CVE has no exact match at all.
+		cpes := am[vi.CveID].cpes.exact
+		if len(cpes) == 0 {
+			cpes = am[vi.CveID].cpes.vp
+		}
+		if len(cpes) > 0 {
+			out := make([]string, 0, len(cpes))
+			for _, fs := range cpes {
+				if origs, ok := fsToOriginalCPE[fs]; ok {
+					out = append(out, origs...)
+				} else {
+					out = append(out, fs)
+				}
+			}
+			vi.CpeURIs = out
+		}
+
+		// Populate WindowsKBFixedIns and KB-based DistroAdvisories for Microsoft detections
+		if string(scanned.Family) == ecosystemTypes.EcosystemTypeMicrosoft {
+			for _, kbID := range am[vi.CveID].kbIDs {
+				kbWithPrefix := fmt.Sprintf("KB%s", kbID)
+				if !slices.Contains(vi.WindowsKBFixedIns, kbWithPrefix) {
+					vi.WindowsKBFixedIns = append(vi.WindowsKBFixedIns, kbWithPrefix)
+				}
+				da := models.DistroAdvisory{AdvisoryID: kbWithPrefix, Description: "Microsoft Knowledge Base"}
+				vi.DistroAdvisories.AppendIfMissing(&da)
+			}
+		}
+
+		vim[vi.CveID] = vi
+	}
+
+	return vim, nil
+}
+
+func walkVulnerabilityDetections(m map[source]sourceData, scanned scanTypes.ScanResult, vs []vulnerabilityData, noJVNCPEs map[string]struct{}, verifiedProductsByRoot map[dataTypes.RootID]map[string]map[string]struct{}) error {
+	for _, v := range vs {
+		for _, d := range v.Detections {
+			for sourceID, fconds := range d.Contents {
+				for _, fcond := range fconds {
+					var (
+						statuses []packStatus
+						kbIDs    []string
+						cpes     map[string]cpeMatches
+					)
+					switch d.Ecosystem {
+					case ecosystemTypes.EcosystemTypeCPE:
+						if isSuppressedCPESource(sourceID) {
+							// Suppressed sources (VulnCheck / JVN) are walked ONCE
+							// PER constituent CVE with that CVE's own verified
+							// product set — the part:vendor:product the verified CPE
+							// sources (NVD / Fortinet / Cisco / PaloAlto) DEFINE for
+							// that CVE, mirroring go-cve-dictionary's
+							// isCpeURIAlsoDefinedInVerifiedDataSource. Per-CVE keeps a
+							// verified product for one CVE from suppressing a sibling
+							// and keeps AND/OR satisfaction correct per CVE.
+							for _, cveID := range cveIDsOf(v) {
+								exact, vp, err := walkCPECriteria(sourceID, fcond.Criteria, scanned, noJVNCPEs, verifiedProductsByRoot[v.ID][cveID])
+								if err != nil {
+									return xerrors.Errorf("Failed to walk cpe criteria. err: %w", err)
+								}
+								if len(exact) > 0 || len(vp) > 0 {
+									if cpes == nil {
+										cpes = make(map[string]cpeMatches)
+									}
+									cpes[cveID] = cpeMatches{exact: exact, vp: vp}
+								}
+							}
+						} else {
+							// The criteria are the root's, not any one CVE's, so
+							// the single walk backs every ID the root reports.
+							exact, vp, err := walkCPECriteria(sourceID, fcond.Criteria, scanned, noJVNCPEs, nil)
+							if err != nil {
+								return xerrors.Errorf("Failed to walk cpe criteria. err: %w", err)
+							}
+							if len(exact) > 0 || len(vp) > 0 {
+								ids := reportIDsOf(v)
+								cpes = make(map[string]cpeMatches, len(ids))
+								for _, id := range ids {
+									cpes[id] = cpeMatches{exact: exact, vp: vp}
+								}
+							}
+						}
+					default:
+						s, k, err := walkPkgCriteria(d.Ecosystem, sourceID, fcond.Criteria, fcond.Tag, scanned)
+						if err != nil {
+							return xerrors.Errorf("Failed to walk pkg criteria. err: %w", err)
+						}
+						statuses, kbIDs = s, k
+					}
+
+					// A condition with no detection signal is skipped
+					// WITHOUT registering it in m: the downstream walk
+					// treats presence in m as "this source detected
+					// something", and an empty entry would emit contents
+					// for an undetected CVE. A CPE source's per-ID result
+					// counts as a signal too.
+					if len(statuses) == 0 && len(kbIDs) == 0 && len(cpes) == 0 {
+						continue
+					}
+
+					src := source{
+						RootID:   v.ID,
+						SourceID: sourceID,
+						Segment: segmentTypes.Segment{
+							Ecosystem: d.Ecosystem,
+							Tag:       fcond.Tag,
+						},
+					}
+					base := m[src]
+					// Plain appends here; postConvert owns de-duplication when
+					// it accumulates these across a CVE's sources.
+					base.packStatuses = append(base.packStatuses, statuses...)
+					base.kbIDs = append(base.kbIDs, kbIDs...)
+					for id, cm := range cpes {
+						if base.cpes == nil {
+							base.cpes = make(map[string]cpeMatches)
+						}
+						prev := base.cpes[id]
+						base.cpes[id] = cpeMatches{
+							exact: append(slices.Clip(prev.exact), cm.exact...),
+							vp:    append(slices.Clip(prev.vp), cm.vp...),
+						}
+					}
+					m[src] = base
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// walkCPECriteria projects a cpe-ecosystem condition onto vuls0's flat result.
+// All CPE match semantics — WFN attribute matching, range/cpematch evaluation,
+// and the exact vs version-unconfirmed quality judgement — already happened in
+// vuls-data-update's cpecriterion.Match; this function only reads the resulting
+// AcceptQueries.CPE indices and collects the supporting scanned CPEs (FS form)
+// into vuls0's two confidence tiers:
+//
+//   - Accepts.CPE.Exact (version-confirmed match) → exact tier
+//   - Accepts.CPE.VersionUnconfirmed (accepted, but no version confirmation)
+//     → vendor:product tier
+//
+// The tree must be walk-ready — a flat OR of vulnerable+accepted
+// criterions, projectCPECriteria's fold guarantees it. Everything else
+// (guards, other criterion types, AND structure — see projectCPECriteria
+// for the go-cve-dictionary flattening compatibility) was removed there,
+// so each criterion contributes its matches independently and nothing can
+// veto the result.
+//
+// A CPE source that carries no version data at all (JVN) is reported at
+// vendor:product regardless of the projected tier — that is a
+// source-semantics decision, kept here in vuls0.
+//
+// For a suppressed source (VulnCheck / JVN) a matched scanned CPE is dropped
+// when its part:vendor:product is in verifiedProducts — the products a verified
+// source (NVD / Fortinet / Cisco / PaloAlto) DEFINES for this CVE — reproducing
+// go-cve-dictionary's isCpeURIAlsoDefinedInVerifiedDataSource (applied there to
+// both VulnCheck and JVN). The suppression keys off the scanned CPE (user
+// input), not the source's criteria, so it needs no knowledge of how the
+// extractor structures the data: VulnCheck criteria that merely mirror NVD's
+// applicability tree contribute only products NVD also defines, which are in
+// verifiedProducts and dropped here, leaving the source's own additional
+// products as the surfaced signal.
+func walkCPECriteria(sourceID sourceTypes.SourceID, ca criteriaTypes.FilteredCriteria, scanned scanTypes.ScanResult, noJVNCPEs map[string]struct{}, verifiedProducts map[string]struct{}) ([]string, []string, error) {
+	scannedCPE := func(index int) (string, error) {
+		if index < 0 || len(scanned.CPE) <= index {
+			return "", xerrors.Errorf("Too large CPE index. len(CPE): %d, index: %d", len(scanned.CPE), index)
+		}
+		return scanned.CPE[index], nil
+	}
+
+	// suppress reports whether a matched scanned CPE must be dropped for this
+	// source. Two independent reasons:
+	//   - the CPE was scanned with UseJVN:false and this is a JVN source
+	//     (per-CPE "no JVN", e.g. macOS Apple CPEs); or
+	//   - a verified source already defines the CPE's part:vendor:product for
+	//     this CVE and this is a suppressed source (VulnCheck / JVN).
+	// Every other source returns its matches unchanged.
+	suppress := func(fs string) bool {
+		if isJVNCPESource(sourceID) {
+			if _, noJVN := noJVNCPEs[fs]; noJVN {
+				return true
+			}
+		}
+		if !isSuppressedCPESource(sourceID) {
+			return false
+		}
+		key, ok := cpeProductKey(fs)
+		if !ok {
+			return false
+		}
+		_, ok = verifiedProducts[key]
+		return ok
+	}
+
+	// Fail fast on a tree that is not projectCPECriteria's output shape,
+	// rather than silently mis-walking it — matching walkPkgCriteria's
+	// precondition discipline.
+	if ca.Operator != criteriaTypes.CriteriaOperatorTypeOR || len(ca.Criterias) > 0 {
+		return nil, nil, xerrors.Errorf("not a walk-ready tree. operator: %s, nested criterias: %d", ca.Operator, len(ca.Criterias))
+	}
+
+	var exact, vp []string
+	for _, cn := range ca.Criterions {
+		for _, index := range cn.Accepts.CPE.Exact {
+			fs, err := scannedCPE(index)
+			if err != nil {
+				return nil, nil, xerrors.Errorf("Failed to walk criteria. err: %w", err)
+			}
+			if suppress(fs) {
+				continue
+			}
+			exact = append(exact, fs)
+		}
+		for _, index := range cn.Accepts.CPE.VersionUnconfirmed {
+			fs, err := scannedCPE(index)
+			if err != nil {
+				return nil, nil, xerrors.Errorf("Failed to walk criteria. err: %w", err)
+			}
+			if suppress(fs) {
+				continue
+			}
+			vp = append(vp, fs)
+		}
+	}
+
+	// JVN carries no version data, so even an exact-tier projection only
+	// confirms the product. Demote before dedup so the tier-exclusion below
+	// sees the final tiers. This is a source-semantics call, not a CPE-match
+	// one, so it lives in vuls0 rather than the source-agnostic matcher.
+	if isJVNCPESource(sourceID) {
+		vp = append(vp, exact...)
+		exact = nil
+	}
+
+	exact = appendMissing(nil, exact)
+	vp = appendMissing(nil, vp)
+
+	// The tiers are exclusive per scanned CPE: one confirmed at exact level
+	// (e.g. by another OR leg) does not also report at vendor:product level.
+	vp = slices.DeleteFunc(vp, func(fs string) bool { return slices.Contains(exact, fs) })
+	if len(vp) == 0 {
+		vp = nil
+	}
+	return exact, vp, nil
+}
+
+// isJVNCPESource reports whether a CPE-ecosystem detection from this source
+// carries no version data and must therefore be reported at vendor:product
+// regardless of the projected match quality. JVN's CPE entries are all
+// version=ANY with no range; add any future JVN CPE source here.
+func isJVNCPESource(sourceID sourceTypes.SourceID) bool {
+	switch sourceID {
+	case sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+		return true
+	default:
+		return false
+	}
+}
+
+// OpenSSH belongs to the same category without a go-cve-dictionary counterpart:
+// openssh-security is the upstream project's own statement of which releases a
+// flaw applies to, stated as a bounded range per entry, so it dominates a
+// supplementary source's version-less openbsd:openssh match.
+//
+// verifiedCPESources are the "verified" CPE data sources whose
+// affected-configuration data go-cve-dictionary trusts over the supplementary
+// sources' coarser/auto-generated data: NVD, Fortinet, Cisco, PaloAlto. A
+// supplementary CPE match is suppressed when its part:vendor:product is also
+// defined by one of these (kept in sync with toCveContentType's verified CPE
+// sources). Fortinet/Cisco/PaloAlto only contribute once migrated to the vuls2
+// DB; until then GetVulnerabilityData simply returns nothing for them.
+//
+// Apple has no go-cve-dictionary counterpart but belongs to the same category:
+// apple-security-releases is the vendor's own PSIRT feed and states an exact
+// version bound per release, so it strictly dominates a supplementary source's
+// version-less apple:macos / apple:safari match. Suppression is keyed per CVE,
+// so it only fires where Apple detected the very same CVE on the very same
+// product — never where Apple has no advisory.
+var verifiedCPESources = []sourceTypes.SourceID{
+	sourceTypes.NVDAPICVE, sourceTypes.NVDFeedCVEv1, sourceTypes.NVDFeedCVEv2,
+	sourceTypes.FortinetCSAF, sourceTypes.FortinetCVRF,
+	sourceTypes.PaloAltoCSAF, sourceTypes.PaloAltoJSON, sourceTypes.PaloAltoList,
+	sourceTypes.CiscoCSAF, sourceTypes.CiscoCVRF, sourceTypes.CiscoJSON,
+	sourceTypes.AppleSecurityReleases,
+	sourceTypes.OpenSSHSecurity,
+}
+
+// isSuppressedCPESource reports whether a CPE-ecosystem source's matches are
+// subject to verified-source suppression. go-cve-dictionary applies the
+// identical isCpeURIAlsoDefinedInVerifiedDataSource gate to both VulnCheck and
+// JVN (db.go), so they share this list. Sources here must NOT appear in
+// verifiedCPESources (a source cannot suppress itself).
+func isSuppressedCPESource(sourceID sourceTypes.SourceID) bool {
+	switch sourceID {
+	case sourceTypes.VulnCheckNISTNVD2,
+		sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+		return true
+	default:
+		return false
+	}
+}
+
+// hasSuppressedCPESource reports whether any CPE-ecosystem detection of the CVE
+// comes from a suppressed source — i.e. whether the verified-product lookup is
+// worth doing for this RootID.
+func hasSuppressedCPESource(v vulnerabilityData) bool {
+	for _, d := range v.Detections {
+		if d.Ecosystem != ecosystemTypes.EcosystemTypeCPE {
+			continue
+		}
+		for sourceID := range d.Contents {
+			if isSuppressedCPESource(sourceID) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// collectVerifiedProducts builds, per RootID that has a suppressed CPE source,
+// the set of part:vendor:product the verified sources (NVD / Fortinet / Cisco /
+// PaloAlto) DEFINE for each of the root's CVEs — the input to walkCPECriteria's
+// suppression, reproducing go-cve-dictionary's isCpeURIAlsoDefinedInVerifiedDataSource
+// (every CPE the verified sources list for the CVE, regardless of whether its
+// version matched the scan). The map is keyed by the suppressed source's RootID,
+// then by constituent CVE ID, so a multi-CVE root keeps each CVE's product set
+// separate (a verified product for one CVE must not suppress a sibling).
+//
+// It is derived entirely from the in-memory detection result — no per-CVE DB
+// re-fetch. cpe.Detect finds candidate roots through a part:vendor:product index
+// (version-agnostic) and util.Detect returns EVERY source's full criteria for
+// each such root unconditionally, so a verified source's defined products are
+// already present as the conditions' DefinedProducts (harvested from the
+// full trees by projectCPECriteria). A verified root absent from the
+// result can only define products that were not scanned (else the index would
+// have surfaced it), and suppress() only ever looks up scanned products, so the
+// result is identical to a by-CVE-ID fetch for suppression purposes.
+func collectVerifiedProducts(detected detectResult) map[dataTypes.RootID]map[string]map[string]struct{} {
+	// Pass 1: union the verified sources' defined products per CVE across every
+	// detected root.
+	verifiedByCVE := make(map[string]map[string]struct{})
+	for _, v := range detected.Detected {
+		set := make(map[string]struct{})
+		for _, d := range v.Detections {
+			if d.Ecosystem != ecosystemTypes.EcosystemTypeCPE {
+				continue
+			}
+			for sourceID, conds := range d.Contents {
+				if !slices.Contains(verifiedCPESources, sourceID) {
+					continue
+				}
+				for _, cond := range conds {
+					maps.Copy(set, cond.DefinedProducts)
+				}
+			}
+		}
+		if len(set) == 0 {
+			continue
+		}
+		for _, cveID := range cveIDsOf(v) {
+			m, ok := verifiedByCVE[cveID]
+			if !ok {
+				m = make(map[string]struct{})
+				verifiedByCVE[cveID] = m
+			}
+			maps.Copy(m, set)
+		}
+	}
+
+	// Pass 2: attach the per-CVE product set to each suppressed-source root.
+	out := make(map[dataTypes.RootID]map[string]map[string]struct{})
+	for _, v := range detected.Detected {
+		if !hasSuppressedCPESource(v) {
+			continue
+		}
+		byCVE := make(map[string]map[string]struct{})
+		for _, cveID := range cveIDsOf(v) {
+			if set, ok := verifiedByCVE[cveID]; ok {
+				byCVE[cveID] = set
+			}
+		}
+		if len(byCVE) > 0 {
+			out[v.ID] = byCVE
+		}
+	}
+	return out
+}
+
+// reportIDsOf returns every ID a detection's root can surface as a VulnInfo:
+// its CVE IDs (cveIDsOf) and, for the advisory-only fallback in
+// walkVulnerabilityDatas, its advisory IDs. A non-suppressed CPE source's
+// matches are recorded under each of them, so whichever VulnInfo the root ends
+// up producing finds its matches by its own ID.
+func reportIDsOf(v vulnerabilityData) []string {
+	ids := make(map[string]struct{})
+	for _, id := range cveIDsOf(v) {
+		ids[id] = struct{}{}
+	}
+	for _, vda := range v.Advisories {
+		for _, rm := range vda.Contents {
+			for _, a := range rm[v.ID] {
+				ids[string(a.Content.ID)] = struct{}{}
+			}
+		}
+	}
+	return slices.Collect(maps.Keys(ids))
+}
+
+// cveIDsOf returns the CVE IDs carried by a detection's vulnerability content.
+// For NVD / VulnCheck the RootID already is the CVE ID; for sources rooted
+// elsewhere (e.g. JVN under a JVNDB-* root) the CVE ID is read from the content.
+func cveIDsOf(v vulnerabilityData) []string {
+	ids := make(map[string]struct{})
+	for _, vdv := range v.Vulnerabilities {
+		for _, rm := range vdv.Contents {
+			for _, vuln := range rm[v.ID] {
+				ids[string(vuln.Content.ID)] = struct{}{}
+			}
+		}
+	}
+	return slices.Collect(maps.Keys(ids))
+}
+
+// walkPkgCriteria walks a package/KB condition's criteria tree for package
+// statuses and KB IDs. The tree must already be gate-pruned —
+// projectOSPkgDetection's fold guarantees this.
+func walkPkgCriteria(e ecosystemTypes.Ecosystem, sourceID sourceTypes.SourceID, ca criteriaTypes.FilteredCriteria, tag segmentTypes.DetectionTag, scanned scanTypes.ScanResult) ([]packStatus, []string, error) {
+	var walk func(ca criteriaTypes.FilteredCriteria) ([]packStatus, []string, bool, error)
+	walk = func(ca criteriaTypes.FilteredCriteria) ([]packStatus, []string, bool, error) {
+		var (
+			statuses []packStatus
+			kbIDs    []string
+		)
+		for _, child := range ca.Criterias {
+			ss, ks, ignore, err := walk(child)
+			if err != nil {
+				return nil, nil, false, xerrors.Errorf("Failed to walk criteria. err: %w", err)
+			}
+			if ignore {
+				switch ca.Operator {
+				case criteriaTypes.CriteriaOperatorTypeAND:
+					return nil, nil, ignore, nil
+				case criteriaTypes.CriteriaOperatorTypeOR:
+					continue
+				default:
+					return nil, nil, false, xerrors.Errorf("unexpected operator: %s", ca.Operator)
+				}
+			}
+			statuses = append(statuses, ss...)
+			kbIDs = append(kbIDs, ks...)
+		}
+
+		for _, cn := range ca.Criterions {
+			if ignoreCriteria(e, sourceID, cn) {
+				return nil, nil, true, nil
+			}
+
+			switch cn.Criterion.Type {
+			case criterionTypes.CriterionTypeVersion:
+				if cn.Criterion.Version == nil {
+					continue
+				}
+
+				if ignoreCriterion(e, cn, tag) {
+					continue
+				}
+
+				fcn, err := filterCriterion(e, scanned, cn)
+				if err != nil {
+					return nil, nil, false, xerrors.Errorf("Failed to filter criterion. err: %w", err)
+				}
+
+				switch fcn.Criterion.Version.Package.Type {
+				case vcPackageTypes.PackageTypeBinary, vcPackageTypes.PackageTypeSource:
+					if !fcn.Criterion.Version.Vulnerable {
+						continue
+					}
+
+					rangeType, fixedIn := func() (vcAffectedRangeTypes.RangeType, string) {
+						if fcn.Criterion.Version.Affected == nil {
+							return vcAffectedRangeTypes.RangeTypeUnknown, ""
+						}
+						return fcn.Criterion.Version.Affected.Type, selectFixedIn(fcn.Criterion.Version.Affected.Type, fcn.Criterion.Version.Affected.Fixed)
+					}()
+
+					for _, index := range fcn.Accepts.Version {
+						if len(scanned.OSPackages) <= index {
+							return nil, nil, false, xerrors.Errorf("Too large OSPackage index. len(OSPackage): %d, index: %d", len(scanned.OSPackages), index)
+						}
+						statuses = append(statuses, packStatus{
+							rangeType: rangeType,
+							status: models.PackageFixStatus{
+								Name: affectedPackageName(e, scanned.OSPackages[index]),
+								FixState: func() string {
+									if fcn.Criterion.Version.FixStatus == nil {
+										return ""
+									}
+									return fixState(e, sourceID, fcn.Criterion.Version.FixStatus.Vendor)
+								}(),
+								FixedIn:     fixedIn,
+								NotFixedYet: fcn.Criterion.Version.FixStatus == nil || fcn.Criterion.Version.FixStatus.Class != vcFixStatusTypes.ClassFixed,
+							},
+						})
+					}
+				default:
+				}
+			case criterionTypes.CriterionTypeKB:
+				if cn.Criterion.KB == nil || (!cn.Accepts.KB.Covered && !cn.Accepts.KB.Unapplied) {
+					continue
+				}
+				kbIDs = append(kbIDs, cn.Criterion.KB.KBID)
+			default:
+				continue
+			}
+		}
+		return statuses, kbIDs, false, nil
+	}
+
+	statuses, kbIDs, _, err := walk(ca)
+	if err != nil {
+		return nil, nil, xerrors.Errorf("Failed to walk criteria. err: %w", err)
+	}
+	return statuses, kbIDs, nil
+}
+
+func walkVulnerabilityDatas(m map[source]sourceData, vds []vulnerabilityData) error {
+	for _, vd := range vds {
+		am := make(map[source]models.DistroAdvisories)
+		for _, vda := range vd.Advisories {
+			for sid, rm := range vda.Contents {
+				if rm == nil {
+					return xerrors.Errorf("advisories map is nil, root id: %q -> advisories[source id: %q]", vd.ID, sid)
+				}
+				for _, a := range rm[vd.ID] {
+					for _, segment := range a.Segments {
+						src := source{
+							RootID:   vd.ID,
+							SourceID: sid,
+							Segment:  segment,
+						}
+
+						if _, ok := m[src]; !ok {
+							continue
+						}
+
+						am[src] = append(am[src], models.DistroAdvisory{
+							AdvisoryID: string(a.Content.ID),
+							Severity: func() string {
+								for _, s := range a.Content.Severity {
+									if s.Type == severityTypes.SeverityTypeVendor && s.Vendor != nil {
+										return *s.Vendor
+									}
+								}
+								return ""
+							}(),
+							Issued: func() time.Time {
+								if a.Content.Published != nil {
+									return *a.Content.Published
+								}
+								return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+							}(),
+							Updated: func() time.Time {
+								if a.Content.Modified != nil {
+									return *a.Content.Modified
+								}
+								return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+							}(),
+							Description: a.Content.Description,
+						})
+					}
+				}
+			}
+		}
+
+		srcsWithVulns := make(map[source]struct{})
+		for _, vdv := range vd.Vulnerabilities {
+			for sid, rm := range vdv.Contents {
+				if rm == nil {
+					return xerrors.Errorf("vulnerabilities map is nil, root id: %q -> vulnerabilities[source id: %q]", vd.ID, sid)
+				}
+				for _, v := range rm[vd.ID] {
+					for _, segment := range v.Segments {
+						src := source{
+							RootID:   vd.ID,
+							SourceID: sid,
+							Segment:  segment,
+						}
+
+						sd, ok := m[src]
+						if !ok {
+							continue
+						}
+
+						srcsWithVulns[src] = struct{}{}
+
+						if ignoreVulnerability(src.Segment.Ecosystem, src.SourceID, v, am[src]) {
+							continue
+						}
+
+						vinfo, err := func() (models.VulnInfo, error) {
+							bs, err := json.Marshal([]source{src})
+							if err != nil {
+								return models.VulnInfo{}, xerrors.Errorf("Failed to marshal sources. err: %w", err)
+							}
+
+							fdas := filterDistroAdvisories(src.Segment.Ecosystem, src.SourceID, am[src])
+							cctype := toCveContentType(src.Segment.Ecosystem, sid)
+							cvss2, cvss3, cvss40 := toCvss(src.Segment.Ecosystem, sid, v.Content.Severity)
+
+							var rs models.References
+							for _, r := range v.Content.References {
+								rs = append(rs, toReference(r.URL))
+							}
+							for _, da := range fdas {
+								ar, err := advisoryReference(src.Segment.Ecosystem, src.SourceID, da)
+								if err != nil {
+									return models.VulnInfo{}, xerrors.Errorf("Failed to get advisory reference. err: %w", err)
+								}
+								if !slices.ContainsFunc(rs, func(r models.Reference) bool {
+									return r.Link == ar.Link && r.Source == ar.Source && r.RefID == ar.RefID && slices.Equal(r.Tags, ar.Tags)
+								}) {
+									rs = append(rs, ar)
+								}
+							}
+
+							// Map content-level Exploit / Mitigations into the
+							// vuls0 models — NVD content only. The NVD feed
+							// extractor lifts detection-relevant reference tags
+							// ("Exploit", "Mitigation") into these slots
+							// (Exploit.Link / Remediation.Description carry the
+							// reference URL), matching what the former
+							// go-cve-dictionary NVD conversion produced. Other
+							// sources (e.g. Red Hat) also populate these slots
+							// but with different semantics; mapping them here
+							// would mis-label entries as ExploitTypeNVD, so they
+							// are intentionally left to their own renderers.
+							var (
+								exploits    []models.Exploit
+								mitigations []models.Mitigation
+							)
+							if cctype == models.Nvd {
+								for _, e := range v.Content.Exploit {
+									if e.Link == "" {
+										continue
+									}
+									exploits = append(exploits, models.Exploit{
+										ExploitType: models.ExploitTypeNVD,
+										URL:         e.Link,
+									})
+								}
+								for _, m := range v.Content.Mitigations {
+									if m.Description == "" {
+										continue
+									}
+									mitigations = append(mitigations, models.Mitigation{
+										CveContentType: models.Nvd,
+										URL:            m.Description,
+									})
+								}
+							}
+
+							cc := models.CveContent{
+								Type:           cctype,
+								CveID:          string(v.Content.ID),
+								Title:          v.Content.Title,
+								Summary:        v.Content.Description,
+								Cvss2Score:     cvss2.BaseScore,
+								Cvss2Vector:    cvss2.Vector,
+								Cvss2Severity:  cvss2.NVDBaseSeverity,
+								Cvss3Score:     cvss3.BaseScore,
+								Cvss3Vector:    cvss3.Vector,
+								Cvss3Severity:  cvss3.BaseSeverity,
+								Cvss40Score:    cvss40.Score,
+								Cvss40Vector:   cvss40.Vector,
+								Cvss40Severity: cvss40.Severity,
+								SourceLink:     cveContentSourceLink(cctype, v, src.RootID),
+								References:     rs,
+								CweIDs: func() []string {
+									var cs []string
+									for _, cwe := range v.Content.CWE {
+										cs = append(cs, cwe.CWE...)
+									}
+									return cs
+								}(),
+								Published: func() time.Time {
+									if v.Content.Published != nil {
+										return *v.Content.Published
+									}
+									return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+								}(),
+								LastModified: func() time.Time {
+									if v.Content.Modified != nil {
+										return *v.Content.Modified
+									}
+									return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+								}(),
+								Optional: cveContentOptional(src.Segment.Ecosystem, v, string(bs)),
+							}
+
+							// NVD and VulnCheck carry both the CNA's metrics and
+							// their own, so they are reported as one CveContent
+							// per CVSS/CWE source; every other source publishes a
+							// single set and stays a single content.
+							ccs := []models.CveContent{cc}
+							switch cctype {
+							case models.Nvd, models.Vulncheck:
+								ccs = splitCveContentBySource(cc, v.Content.Severity, v.Content.CWE, func(ss []severityTypes.Severity) (v2.CVSSv2, v31.CVSSv31, v40.CVSSv40) {
+									return toCvss(src.Segment.Ecosystem, sid, ss)
+								})
+							default:
+							}
+
+							return models.VulnInfo{
+								CveID:            string(v.Content.ID),
+								Confidences:      models.Confidences{toVuls0Confidence(src.Segment.Ecosystem, src.SourceID, sd.cpes[string(v.Content.ID)])},
+								DistroAdvisories: fdas,
+								Exploits:         exploits,
+								Mitigations:      mitigations,
+								CveContents:      models.NewCveContents(ccs...),
+							}, nil
+						}()
+						if err != nil {
+							return xerrors.Errorf("Failed to create vuln info. err: %w", err)
+						}
+
+						base := m[src]
+						if base.vulninfos == nil {
+							base.vulninfos = make(models.VulnInfos)
+						}
+						base.vulninfos[vinfo.CveID] = vinfo
+						m[src] = base
+					}
+				}
+			}
+		}
+
+		// Remove sources that had vulnerabilities from the advisory map.
+		// The advisory fallback below creates VulnInfo from advisory IDs only when
+		// no vulnerabilities exist for a source. Without this deletion, sources whose
+		// vulnerabilities were all dropped by ignoreVulnerability would incorrectly
+		// fall through to advisory-based VulnInfo creation.
+		for src := range srcsWithVulns {
+			delete(am, src)
+		}
+
+		for src, das := range am {
+			if len(m[src].vulninfos) > 0 {
+				continue
+			}
+
+			fdas := filterDistroAdvisories(src.Segment.Ecosystem, src.SourceID, das)
+			for _, da := range fdas {
+				bs, err := json.Marshal([]source{src})
+				if err != nil {
+					return xerrors.Errorf("Failed to marshal sources. err: %w", err)
+				}
+
+				cctype := toCveContentType(src.Segment.Ecosystem, src.SourceID)
+
+				ar, err := advisoryReference(src.Segment.Ecosystem, src.SourceID, da)
+				if err != nil {
+					return xerrors.Errorf("Failed to get advisory reference. err: %w", err)
+				}
+
+				vinfo := models.VulnInfo{
+					CveID:            da.AdvisoryID,
+					Confidences:      models.Confidences{toVuls0Confidence(src.Segment.Ecosystem, src.SourceID, m[src].cpes[da.AdvisoryID])},
+					DistroAdvisories: models.DistroAdvisories{da},
+					CveContents: models.NewCveContents(models.CveContent{
+						Type:         cctype,
+						CveID:        da.AdvisoryID,
+						Summary:      da.Description,
+						SourceLink:   ar.Link,
+						References:   models.References{ar},
+						Published:    da.Issued,
+						LastModified: da.Updated,
+						Optional:     map[string]string{"vuls2-sources": string(bs)},
+					}),
+				}
+
+				base := m[src]
+				if base.vulninfos == nil {
+					base.vulninfos = make(models.VulnInfos)
+				}
+				base.vulninfos[vinfo.CveID] = vinfo
+				m[src] = base
+			}
+		}
+	}
+	return nil
+}
+
+func comparePack(a, b pack) (int, error) {
+	if a.ecosystem == b.ecosystem {
+		if r := compareSourceID(a.ecosystem, a.sourceID, b.sourceID); r != 0 {
+			return r, nil
+		}
+
+		maxTagFn := func(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID, tags []rootTag) segmentTypes.DetectionTag {
+			rt := slices.MaxFunc(tags, func(a, b rootTag) int {
+				return compareTag(e, s, a.tag, b.tag)
+			})
+			return rt.tag
+		}
+
+		if r := compareTag(a.ecosystem, a.sourceID, maxTagFn(a.ecosystem, a.sourceID, a.rootTags), maxTagFn(b.ecosystem, b.sourceID, b.rootTags)); r != 0 {
+			return r, nil
+		}
+	}
+
+	r, err := comparePackStatus(a.packStatus, b.packStatus)
+	if err != nil {
+		return 0, xerrors.Errorf("Failed to compare pack status. err: %w", err)
+	}
+
+	return r, nil
+}
+
+// compareCvssContent orders two same-type CVSS candidates during a merge.
+// Score alone decided before, but tracker-derived contents (Ubuntu/Debian)
+// carry only a severity string — both scores are zero — which left the
+// winner to merge order, itself a map iteration order upstream, so
+// severities flipped between runs.
+//
+// Ties break by vendor severity rank, then by the raw severity and vector
+// strings. Notes on the severity comparison, which is a stopgap:
+//
+//   - The severity compared here is often a vendor severity squatting in
+//     the CVSS fields: models.CveContent has no vendor-severity field, so
+//     postConvert stores tracker severities as CvssNSeverity, and the
+//     (label, vendor scale) pairing the vuls-data-update model preserves is
+//     already lost by this point. Passing source "" ranks the bare label on
+//     the comparator's catch-all table — an empirical union of the
+//     vocabularies currently seen in the data, not part of any data model —
+//     the same compromise the DistroAdvisories merge above makes.
+//   - Do NOT pass a per-pair source to severityVendorTypes.Compare. This
+//     merge folds 3+ contents pairwise in map-iteration order, and a
+//     comparator that switches tables depending on the pair at hand is not
+//     associative: where a vendor table and the catch-all disagree (e.g.
+//     "moderate" ranks above "low" on the Alma table but below everything
+//     on the catch-all), the fold result would depend on merge order again
+//     — the very bug this function exists to fix. A source-aware version
+//     must rank each side on its own source's table (a per-content key
+//     keeps the fold order-free), and is only worth doing once the
+//     upstream tables cover the vocabularies they currently miss (Debian's
+//     "unimportant", the RHEL-family "moderate").
+//   - Distinct strings can still compare equal by rank — same rank group
+//     ("none" vs "unknown") or both absent from every table ("unimportant"
+//     vs "", both rank -1) — hence the raw severity string key after it:
+//     semantically meaningless, but decisive. Severity ranks above vector
+//     because it is the vendor's actual triage judgment, while the vector
+//     key is pure bytes for determinism.
+//
+// The chain returns 0 only when score, severity, and vector are all
+// byte-identical, in which case either side yields the same merged triple.
+func compareCvssContent(scoreA, scoreB float64, severityA, severityB, vectorA, vectorB string) int {
+	return cmp.Or(
+		cmp.Compare(scoreA, scoreB),
+		severityVendorTypes.Compare("", severityA, severityB),
+		cmp.Compare(severityA, severityB),
+		cmp.Compare(vectorA, vectorB),
+	)
+}
+
+// mergeVulnInfo merges two VulnInfos for the same CVE WITHIN one vuls2 run:
+// postConvert builds one VulnInfo per detecting source segment (e.g. RHEL
+// CSAF and VEX, redhat:9 and epel:9) and folds them together here.
+//
+// Not to be confused with mergeIntoScannedCves, which merges across passes
+// and sources at the detectWith level. Both inputs here are vuls2-produced,
+// so a same-type CveContents conflict is RESOLVED — the entry whose
+// Optional["vuls2-sources"] ranks higher wins (and the marker is required:
+// non-vuls2 input is an error). Only content-level fields are handled;
+// AffectedPackages / CpeURIs / WindowsKBFixedIns are aggregated separately
+// by postConvert after this merge.
+func mergeVulnInfo(a, b models.VulnInfo) (models.VulnInfo, error) {
+	if a.CveID != b.CveID {
+		return models.VulnInfo{}, xerrors.Errorf("CVE IDs are different. a: %s, b: %s", a.CveID, b.CveID)
+	}
+
+	info := models.VulnInfo{
+		CveID:       a.CveID,
+		CveContents: models.CveContents{},
+	}
+
+	for _, cc := range []models.Confidences{a.Confidences, b.Confidences} {
+		for _, c := range cc {
+			info.Confidences.AppendIfMissing(c)
+		}
+	}
+
+	for _, e := range slices.Concat(a.Exploits, b.Exploits) {
+		info.Exploits.AppendIfMissing(e)
+	}
+	for _, m := range slices.Concat(a.Mitigations, b.Mitigations) {
+		info.Mitigations.AppendIfMissing(m)
+	}
+
+	am := make(map[string]models.DistroAdvisory)
+	for _, as := range []models.DistroAdvisories{a.DistroAdvisories, b.DistroAdvisories} {
+		for _, a := range as {
+			base, ok := am[a.AdvisoryID]
+			if ok {
+				if cmp.Or(
+					severityVendorTypes.Compare("", base.Severity, a.Severity),
+					base.Issued.Compare(a.Issued),
+					base.Updated.Compare(a.Updated),
+				) < 0 {
+					base = a
+				}
+			} else {
+				base = a
+			}
+			am[a.AdvisoryID] = base
+		}
+	}
+	info.DistroAdvisories = slices.Collect(maps.Values(am))
+
+	// Contents of one type stay in the order they arrive in; like the enrich
+	// passes, this leaves ordering to CveContents.Sort (see
+	// ScanResult.SortForJSONOutput) rather than imposing one of its own.
+	ccs := make(models.CveContents)
+	for _, cciter := range []iter.Seq[[]models.CveContent]{maps.Values(a.CveContents), maps.Values(b.CveContents)} {
+		for cc := range cciter {
+			for _, c := range cc {
+				// A type can hold several contents, one per CVSS/CWE source
+				// (nvd/vulncheck report both the CNA's metrics and their own,
+				// mitre one per CNA/ADP container). Those are separate metric
+				// sets rather than rival reports of the same one, so a content
+				// merges only into one of the same source — merging across
+				// sources would fabricate a set no source published. The
+				// source is empty for every single-content type, which leaves
+				// their merging keyed by type alone as before.
+				i := slices.IndexFunc(ccs[c.Type], func(e models.CveContent) bool {
+					return e.Optional["source"] == c.Optional["source"]
+				})
+				if i >= 0 {
+					base := ccs[c.Type][i]
+					var src1 []source //nolint:prealloc
+					if err := json.Unmarshal([]byte(base.Optional["vuls2-sources"]), &src1); err != nil {
+						return models.VulnInfo{}, xerrors.Errorf("Failed to unmarshal sources. err: %w", err)
+					}
+					var src2 []source
+					if err := json.Unmarshal([]byte(c.Optional["vuls2-sources"]), &src2); err != nil {
+						return models.VulnInfo{}, xerrors.Errorf("Failed to unmarshal sources. err: %w", err)
+					}
+
+					merged := models.CveContent{
+						Type:         base.Type,
+						CveID:        base.CveID,
+						Title:        base.Title,
+						Summary:      base.Summary,
+						SSVC:         base.SSVC,
+						SourceLink:   base.SourceLink,
+						Published:    base.Published,
+						LastModified: base.LastModified,
+						Optional:     base.Optional,
+					}
+
+					if compareSource(slices.MaxFunc(src1, compareSource), slices.MaxFunc(src2, compareSource)) < 0 {
+						merged = models.CveContent{
+							Type:         c.Type,
+							CveID:        c.CveID,
+							Title:        c.Title,
+							Summary:      c.Summary,
+							SSVC:         c.SSVC,
+							SourceLink:   c.SourceLink,
+							Published:    c.Published,
+							LastModified: c.LastModified,
+							Optional:     c.Optional,
+						}
+					}
+
+					if compareCvssContent(base.Cvss40Score, c.Cvss40Score, base.Cvss40Severity, c.Cvss40Severity, base.Cvss40Vector, c.Cvss40Vector) < 0 {
+						merged.Cvss40Score = c.Cvss40Score
+						merged.Cvss40Vector = c.Cvss40Vector
+						merged.Cvss40Severity = c.Cvss40Severity
+					} else {
+						merged.Cvss40Score = base.Cvss40Score
+						merged.Cvss40Vector = base.Cvss40Vector
+						merged.Cvss40Severity = base.Cvss40Severity
+					}
+
+					switch {
+					case strings.HasPrefix(base.Cvss3Vector, "CVSS:3.0") && strings.HasPrefix(c.Cvss3Vector, "CVSS:3.1"):
+						merged.Cvss3Score = c.Cvss3Score
+						merged.Cvss3Vector = c.Cvss3Vector
+						merged.Cvss3Severity = c.Cvss3Severity
+					case strings.HasPrefix(base.Cvss3Vector, "CVSS:3.1") && strings.HasPrefix(c.Cvss3Vector, "CVSS:3.0"):
+						merged.Cvss3Score = base.Cvss3Score
+						merged.Cvss3Vector = base.Cvss3Vector
+						merged.Cvss3Severity = base.Cvss3Severity
+					default:
+						if compareCvssContent(base.Cvss3Score, c.Cvss3Score, base.Cvss3Severity, c.Cvss3Severity, base.Cvss3Vector, c.Cvss3Vector) < 0 {
+							merged.Cvss3Score = c.Cvss3Score
+							merged.Cvss3Vector = c.Cvss3Vector
+							merged.Cvss3Severity = c.Cvss3Severity
+						} else {
+							merged.Cvss3Score = base.Cvss3Score
+							merged.Cvss3Vector = base.Cvss3Vector
+							merged.Cvss3Severity = base.Cvss3Severity
+						}
+					}
+
+					if compareCvssContent(base.Cvss2Score, c.Cvss2Score, base.Cvss2Severity, c.Cvss2Severity, base.Cvss2Vector, c.Cvss2Vector) < 0 {
+						merged.Cvss2Score = c.Cvss2Score
+						merged.Cvss2Vector = c.Cvss2Vector
+						merged.Cvss2Severity = c.Cvss2Severity
+					} else {
+						merged.Cvss2Score = base.Cvss2Score
+						merged.Cvss2Vector = base.Cvss2Vector
+						merged.Cvss2Severity = base.Cvss2Severity
+					}
+
+					for _, rs := range []models.References{base.References, c.References} {
+						for _, r := range rs {
+							if !slices.ContainsFunc(merged.References, func(e models.Reference) bool {
+								return r.Link == e.Link && r.Source == e.Source && r.RefID == e.RefID && slices.Equal(r.Tags, e.Tags)
+							}) {
+								merged.References = append(merged.References, r)
+							}
+						}
+					}
+
+					for _, cs := range [][]string{base.CweIDs, c.CweIDs} {
+						for _, c := range cs {
+							if !slices.Contains(merged.CweIDs, c) {
+								merged.CweIDs = append(merged.CweIDs, c)
+							}
+						}
+					}
+
+					srcs := append(src1, src2...)
+					slices.SortFunc(srcs, compareSource)
+					bs, err := json.Marshal(srcs)
+					if err != nil {
+						return models.VulnInfo{}, xerrors.Errorf("Failed to marshal sources. err: %w", err)
+					}
+					merged.Optional["vuls2-sources"] = string(bs)
+
+					ccs[c.Type][i] = merged
+				} else {
+					ccs[c.Type] = append(ccs[c.Type], c)
+				}
+			}
+		}
+	}
+	info.CveContents = ccs
+
+	return info, nil
+}
+
+func toReference(ref string) models.Reference {
+	switch {
+	case strings.HasPrefix(ref, "https://www.cve.org/CVERecord?id="):
+		return models.Reference{
+			Link:   ref,
+			Source: "CVE",
+			RefID:  strings.TrimPrefix(ref, "https://www.cve.org/CVERecord?id="),
+		}
+	case strings.HasPrefix(ref, "https://cve.mitre.org/cgi-bin/cvename.cgi?name="):
+		return models.Reference{
+			Link:   ref,
+			Source: "MITRE",
+			RefID:  strings.TrimPrefix(ref, "https://cve.mitre.org/cgi-bin/cvename.cgi?name="),
+		}
+	case strings.HasPrefix(ref, "https://nvd.nist.gov/vuln/detail/"):
+		return models.Reference{
+			Link:   ref,
+			Source: "NVD",
+			RefID:  strings.TrimPrefix(ref, "https://nvd.nist.gov/vuln/detail/"),
+		}
+	case strings.HasPrefix(ref, "https://access.redhat.com/"), strings.HasPrefix(ref, "https://bugzilla.redhat.com/"):
+		switch {
+		case strings.HasPrefix(ref, "https://access.redhat.com/security/cve/"):
+			return models.Reference{
+				Link:   ref,
+				Source: "REDHAT",
+				RefID:  strings.TrimPrefix(ref, "https://access.redhat.com/security/cve/"),
+			}
+		case strings.HasPrefix(ref, "https://access.redhat.com/errata/"):
+			return models.Reference{
+				Link:   ref,
+				Source: "REDHAT",
+				RefID:  strings.TrimPrefix(ref, "https://access.redhat.com/errata/"),
+			}
+		case strings.HasPrefix(ref, "https://bugzilla.redhat.com/show_bug.cgi?id="):
+			return models.Reference{
+				Link:   ref,
+				Source: "REDHAT",
+				RefID:  strings.TrimPrefix(ref, "https://bugzilla.redhat.com/show_bug.cgi?id="),
+			}
+		default:
+			return models.Reference{
+				Link:   ref,
+				Source: "REDHAT",
+			}
+		}
+	case strings.HasPrefix(ref, "https://bodhi.fedoraproject.org/"):
+		switch {
+		case strings.HasPrefix(ref, "https://bodhi.fedoraproject.org/updates/"):
+			return models.Reference{
+				Link:   ref,
+				Source: "FEDORA",
+				RefID:  strings.TrimPrefix(ref, "https://bodhi.fedoraproject.org/updates/"),
+			}
+		default:
+			return models.Reference{
+				Link:   ref,
+				Source: "FEDORA",
+			}
+		}
+	case strings.HasPrefix(ref, "https://errata.almalinux.org/"):
+		u, err := url.Parse(ref)
+		if err != nil {
+			return models.Reference{
+				Link:   ref,
+				Source: "ALMA",
+			}
+		}
+
+		ss := strings.Split(strings.TrimSuffix(path.Base(u.Path), ".html"), "-")
+		if len(ss) != 3 {
+			return models.Reference{
+				Link:   ref,
+				Source: "ALMA",
+			}
+		}
+
+		return models.Reference{
+			Link:   ref,
+			Source: "ALMA",
+			RefID:  fmt.Sprintf("%s-%s:%s", ss[0], ss[1], ss[2]),
+		}
+	case strings.HasPrefix(ref, "https://errata.build.resf.org/"):
+		return models.Reference{
+			Link:   ref,
+			Source: "ROCKY",
+			RefID:  strings.TrimPrefix(ref, "https://errata.build.resf.org/"),
+		}
+	case strings.HasPrefix(ref, "https://linux.oracle.com/"):
+		switch {
+		case strings.HasPrefix(ref, "https://linux.oracle.com/cve/"):
+			return models.Reference{
+				Link:   ref,
+				Source: "ORACLE",
+				RefID:  strings.TrimPrefix(strings.TrimSuffix(ref, ".html"), "https://linux.oracle.com/cve/"),
+			}
+		case strings.HasPrefix(ref, "https://linux.oracle.com/errata/"):
+			return models.Reference{
+				Link:   ref,
+				Source: "ORACLE",
+				RefID:  strings.TrimPrefix(strings.TrimSuffix(ref, ".html"), "https://linux.oracle.com/errata/"),
+			}
+		default:
+			return models.Reference{
+				Link:   ref,
+				Source: "ORACLE",
+			}
+		}
+	case strings.HasPrefix(ref, "https://security.alpinelinux.org/vuln/"):
+		return models.Reference{
+			Link:   ref,
+			Source: "ALPINE",
+			RefID:  strings.TrimPrefix(ref, "https://security.alpinelinux.org/vuln/"),
+		}
+	case strings.HasPrefix(ref, "https://ubuntu.com/security/"):
+		switch {
+		case strings.HasPrefix(ref, "https://ubuntu.com/security/CVE-"):
+			return models.Reference{
+				Link:   ref,
+				Source: "UBUNTU",
+				RefID:  strings.TrimPrefix(ref, "https://ubuntu.com/security/"),
+			}
+		case strings.HasPrefix(ref, "https://ubuntu.com/security/notices/"):
+			return models.Reference{
+				Link:   ref,
+				Source: "UBUNTU",
+				RefID:  strings.TrimPrefix(ref, "https://ubuntu.com/security/notices/"),
+			}
+		default:
+			return models.Reference{
+				Link:   ref,
+				Source: "UBUNTU",
+			}
+		}
+	default:
+		return models.Reference{
+			Link:   ref,
+			Source: "MISC",
+		}
+	}
+}
+
+// enrich adds vulnerability data from specific enrichment sources (KEV, RedHat
+// CVE, NVD) to the already-detected VulnInfos. This replaces gost.FillCVEsWithRedHat
+// and the NVD slice of FillCvesWithGoCVEDictionary, and also provides cross-source
+// enrichment (e.g., RedHat CVE / NVD data for Debian-detected CVEs).
+func enrich(sesh *session.Session, vim models.VulnInfos) error {
+	for cveID, vi := range vim {
+		vd, err := sesh.GetVulnerabilityDataByVulnerabilityID(vulnerabilityContentTypes.VulnerabilityID(cveID), dbTypes.Filter{
+			Contents: []dbTypes.FilterContentType{
+				dbTypes.FilterContentTypeAdvisories,
+				dbTypes.FilterContentTypeVulnerabilities,
+			},
+			DataSources: []sourceTypes.SourceID{
+				sourceTypes.CISAKEV,
+				sourceTypes.ENISAEUVDList,
+				sourceTypes.ENISAKEV,
+				sourceTypes.ExploitExploitDB,
+				sourceTypes.ExploitGitHub,
+				sourceTypes.ExploitInTheWild,
+				sourceTypes.ExploitTrickest,
+				sourceTypes.JVNFeedRSS,
+				sourceTypes.Metasploit,
+				sourceTypes.MitreCVEV5,
+				sourceTypes.NVDFeedCVEv2,
+				sourceTypes.NucleiRepository,
+				sourceTypes.RedHatCVE,
+				sourceTypes.VulnCheckKEV,
+				sourceTypes.VulnCheckNISTNVD2,
+			},
+		})
+		if err != nil {
+			if errors.Is(err, dbTypes.ErrNotFoundVulnerability) {
+				continue
+			}
+			return xerrors.Errorf("Failed to get vulnerability. CVE-ID: %s, err: %w", cveID, err)
+		}
+
+		if vi.CveContents == nil {
+			vi.CveContents = models.NewCveContents()
+		}
+
+		enrichVulnerabilities(&vi, vd.Vulnerabilities)
+		enrichAdvisories(&vi, vd.Advisories)
+
+		vim[cveID] = vi
+	}
+	return nil
+}
+
+// yearRe extracts the 4-digit year (20YY) from a CWE View name such as
+// "Weaknesses in the 2024 CWE Top 25 Most Dangerous Software Weaknesses" or
+// "Weaknesses in OWASP Top Ten (2021)" — both forms produced by the mitre-cwe
+// extractor in vuls-data-update.
+var yearRe = regexp.MustCompile(`\b(20\d{2})\b`)
+
+// getCWEDictEntry fetches the CWE record for cweID and returns the resulting
+// CWEDictEntry plus the raw per-source map (so the caller can walk
+// RelatedAttackPatterns without a second storage call). On success entry.En
+// is always non-nil — at minimum a {CweID, Lang: "en"} stub that the
+// MitreCWE source record overwrites when present, so consumers can always
+// fall back to the English side. entry.Ja is left nil unless the
+// JVNFeedRSS source actually ships a record for this id, so consumers
+// (e.g. CWEDict.Get's "ja" branch) can use `dict.Ja != nil` to mean
+// "we have a Japanese name" without false positives from a placeholder.
+//
+// ErrNotFoundCWE is a soft miss — entry is zero and m is nil (mirroring
+// getCAPECDictEntry / getATTACKDictEntry); any other storage error is
+// wrapped and propagated.
+func getCWEDictEntry(sesh *session.Session, cweID string) (models.CWEDictEntry, map[sourceTypes.SourceID]cweTypes.CWE, error) {
+	id := strings.TrimPrefix(cweID, "CWE-")
+	// Pre-seed only En with a {CweID, Lang}-only stub so a missing-from-mitre
+	// case still has an English fallback. Ja stays nil — JVNFeedRSS either
+	// fills it with a real name below or it stays nil to signal absence.
+	entry := models.CWEDictEntry{
+		En:                 &cwe.CWE{CWEID: id, Lang: "en"},
+		OwaspTopTens:       map[string]string{},
+		CweTopTwentyfives:  map[string]string{},
+		SansTopTwentyfives: map[string]string{},
+	}
+
+	m, err := sesh.Storage().GetCWE(cweID)
+	if err != nil {
+		if errors.Is(err, dbTypes.ErrNotFoundCWE) {
+			return models.CWEDictEntry{}, nil, nil
+		}
+		return models.CWEDictEntry{}, nil, xerrors.Errorf("Failed to get cwe %s. err: %w", cweID, err)
+	}
+
+	for sid, w := range m {
+		switch sid {
+		case sourceTypes.MitreCWE:
+			entry.En = &cwe.CWE{
+				CWEID:               id,
+				Name:                w.Name,
+				Description:         w.Description,
+				ExtendedDescription: w.Weakness.ExtendedDescription,
+				Lang:                "en",
+			}
+			for _, ranking := range w.Weakness.Rankings {
+				year := yearRe.FindString(ranking.ViewName)
+				if year == "" {
+					continue
+				}
+				rank := strconv.Itoa(ranking.Rank)
+				switch {
+				case strings.Contains(ranking.ViewName, "OWASP Top Ten"):
+					entry.OwaspTopTens[year] = rank
+				case strings.Contains(ranking.ViewName, "CWE/SANS Top 25"):
+					entry.SansTopTwentyfives[year] = rank
+				case strings.Contains(ranking.ViewName, "CWE Top 25"):
+					entry.CweTopTwentyfives[year] = rank
+				}
+			}
+		case sourceTypes.JVNFeedRSS:
+			entry.Ja = &cwe.CWE{CWEID: id, Name: w.Name, Lang: "ja"}
+		}
+	}
+	return entry, m, nil
+}
+
+// getCAPECDictEntry fetches the CAPEC record for capecID and returns the
+// resulting CAPECDictEntry plus the raw per-source map. Only the mitre-capec
+// source is consulted for entry data (the only catalog vuls-data-update ships
+// CAPEC records for today). ErrNotFoundCAPEC is a soft miss — entry is zero
+// and m is nil.
+func getCAPECDictEntry(sesh *session.Session, capecID string) (models.CAPECDictEntry, map[sourceTypes.SourceID]capecTypes.CAPEC, error) {
+	m, err := sesh.Storage().GetCAPEC(capecID)
+	if err != nil {
+		if errors.Is(err, dbTypes.ErrNotFoundCAPEC) {
+			return models.CAPECDictEntry{}, nil, nil
+		}
+		return models.CAPECDictEntry{}, nil, xerrors.Errorf("Failed to get capec %s. err: %w", capecID, err)
+	}
+	var entry models.CAPECDictEntry
+	for sid, c := range m {
+		switch sid {
+		case sourceTypes.MitreCAPEC:
+			entry = models.CAPECDictEntry{CAPECID: capecID, Name: c.Name}
+		}
+	}
+	return entry, m, nil
+}
+
+// getATTACKDictEntry fetches the ATT&CK Technique record for attackID and
+// returns the resulting ATTACKDictEntry plus the raw per-source map. Only
+// the mitre-attack source is consulted for entry data (the only catalog
+// vuls-data-update ships ATT&CK records for today). ErrNotFoundAttack is a
+// soft miss — entry is zero and m is nil.
+func getATTACKDictEntry(sesh *session.Session, attackID string) (models.ATTACKDictEntry, map[sourceTypes.SourceID]attackTypes.Attack, error) {
+	m, err := sesh.Storage().GetAttack(kindTypes.Technique, attackID)
+	if err != nil {
+		if errors.Is(err, dbTypes.ErrNotFoundAttack) {
+			return models.ATTACKDictEntry{}, nil, nil
+		}
+		return models.ATTACKDictEntry{}, nil, xerrors.Errorf("Failed to get attack %s. err: %w", attackID, err)
+	}
+	var entry models.ATTACKDictEntry
+	for sid, a := range m {
+		switch sid {
+		case sourceTypes.MitreATTACK:
+			entry = models.ATTACKDictEntry{
+				ATTACKID:  attackID,
+				Name:      a.Name,
+				Platforms: slices.Clone(a.Technique.Platforms),
+			}
+		}
+	}
+	return entry, m, nil
+}
+
+// enrichCTI resolves the CVE → CWE → CAPEC → ATT&CK Technique graph for every
+// VulnInfo in r.ScannedCves, populating per-VulnInfo CTIs and the
+// ScanResult-level CWEDict / CAPECDict / ATTACKDict in a single pass.
+//
+// The traversal per VulnInfo is:
+//
+//	vi.CveContents[*].CweIDs ──▶ cweTypes.CWE.RelatedAttackPatterns ──▶ CAPEC
+//	CAPEC.RelatedAttacks ──▶ ATT&CK Technique
+//
+// Storage() lookups are deduped across VulnInfos via the three caches below,
+// so each unique CWE / CAPEC / ATT&CK id is fetched exactly once per
+// EnrichVulnInfos run regardless of how many CVEs reference it. ErrNotFound*
+// is cached as nil and silently skipped (an id missing from the catalog is
+// not an error — the dataset just hasn't shipped that record yet); any other
+// storage error is propagated to the caller so dataset/db-level breakage
+// doesn't get hidden behind partial dicts.
+func enrichCTI(sesh *session.Session, r *models.ScanResult) error {
+	cweCache := map[string]map[sourceTypes.SourceID]cweTypes.CWE{}
+	capecCache := map[string]map[sourceTypes.SourceID]capecTypes.CAPEC{}
+	attackCache := map[string]map[sourceTypes.SourceID]attackTypes.Attack{}
+
+	for cveID, vi := range r.ScannedCves {
+		cweSet := map[string]struct{}{}
+		for _, conts := range vi.CveContents {
+			for _, c := range conts {
+				for _, id := range c.CweIDs {
+					if id == "" {
+						continue
+					}
+					cweSet[id] = struct{}{}
+				}
+			}
+		}
+		if len(cweSet) == 0 {
+			continue
+		}
+
+		capecSet := map[string]struct{}{}
+		for cweID := range cweSet {
+			m, cached := cweCache[cweID]
+			if !cached {
+				entry, fetched, err := getCWEDictEntry(sesh, cweID)
+				if err != nil {
+					return xerrors.Errorf("Failed to enrich CTI for %s. err: %w", cveID, err)
+				}
+				m = fetched
+				cweCache[cweID] = m
+				if m != nil {
+					if r.CWEDict == nil {
+						r.CWEDict = models.CWEDict{}
+					}
+					r.CWEDict[strings.TrimPrefix(cweID, "CWE-")] = entry
+				}
+			}
+			for sid, w := range m {
+				if sid != sourceTypes.MitreCWE {
+					continue
+				}
+				for _, p := range w.Weakness.RelatedAttackPatterns {
+					if p != "" {
+						capecSet[p] = struct{}{}
+					}
+				}
+			}
+		}
+		if len(capecSet) == 0 {
+			continue
+		}
+
+		attackSet := map[string]struct{}{}
+		for capecID := range capecSet {
+			m, cached := capecCache[capecID]
+			if !cached {
+				entry, fetched, err := getCAPECDictEntry(sesh, capecID)
+				if err != nil {
+					return xerrors.Errorf("Failed to enrich CTI for %s. err: %w", cveID, err)
+				}
+				m = fetched
+				capecCache[capecID] = m
+				if m != nil {
+					if r.CAPECDict == nil {
+						r.CAPECDict = models.CAPECDict{}
+					}
+					r.CAPECDict[capecID] = entry
+				}
+			}
+			for sid, c := range m {
+				if sid != sourceTypes.MitreCAPEC {
+					continue
+				}
+				for _, a := range c.RelatedAttacks {
+					if a != "" {
+						attackSet[a] = struct{}{}
+					}
+				}
+			}
+		}
+
+		for attackID := range attackSet {
+			_, cached := attackCache[attackID]
+			if cached {
+				continue
+			}
+			entry, fetched, err := getATTACKDictEntry(sesh, attackID)
+			if err != nil {
+				return xerrors.Errorf("Failed to enrich CTI for %s. err: %w", cveID, err)
+			}
+			attackCache[attackID] = fetched
+			if fetched != nil {
+				if r.ATTACKDict == nil {
+					r.ATTACKDict = models.ATTACKDict{}
+				}
+				r.ATTACKDict[attackID] = entry
+			}
+		}
+
+		existing := map[string]struct{}{}
+		for _, id := range vi.CTIs {
+			existing[id] = struct{}{}
+		}
+		for id := range capecSet {
+			if _, ok := existing[id]; !ok {
+				vi.CTIs = append(vi.CTIs, id)
+			}
+		}
+		for id := range attackSet {
+			if _, ok := existing[id]; !ok {
+				vi.CTIs = append(vi.CTIs, id)
+			}
+		}
+
+		r.ScannedCves[cveID] = vi
+	}
+	return nil
+}

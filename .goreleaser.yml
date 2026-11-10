@@ -1,19 +1,31 @@
+version: 2
 project_name: vuls
-env:
-  - GO111MODULE=on
+git:
+  # Sort tags treating "-" as a pre-release suffix so that, when multiple tags
+  # point at HEAD (e.g. v0.40.0-rc.1 and v0.40.0), the final tag wins.
+  prerelease_suffix: "-"
 release:
   github:
     owner: future-architect
     name: vuls
+  # Mark releases for tags with a semver pre-release suffix (e.g. v0.41.0-rc.2)
+  # as pre-release; final tags (e.g. v0.41.0) stay regular releases.
+  prerelease: auto
 builds:
 - id: vuls
+  env:
+  - CGO_ENABLED=0
   goos:
   - linux
+  - windows
+  - darwin
   goarch:
   - amd64
+  - arm64
   main: ./cmd/vuls/main.go
   flags:
   - -a
+  - -trimpath
   ldflags: 
   - -s -w -X github.com/future-architect/vuls/config.Version={{.Version}} -X github.com/future-architect/vuls/config.Revision={{.Commit}}-{{ .CommitDate }}
   binary: vuls
@@ -23,15 +35,17 @@ builds:
   - CGO_ENABLED=0
   goos:
   - linux
+  - windows
+  - darwin
   goarch:
-  - 386
   - amd64
-  - arm
   - arm64
   main: ./cmd/scanner/main.go
+  tags:
+  - scanner
   flags:
   - -a
-  - -tags=scanner
+  - -trimpath
   ldflags: 
   - -s -w -X github.com/future-architect/vuls/config.Version={{.Version}} -X github.com/future-architect/vuls/config.Revision={{.Commit}}-{{ .CommitDate }}
   binary: vuls-scanner
@@ -41,12 +55,19 @@ builds:
   - CGO_ENABLED=0
   goos:
   - linux
+  - windows
+  - darwin
   goarch:
-  - 386
   - amd64
-  - arm
   - arm64
   main: ./contrib/trivy/cmd/main.go
+  tags:
+  - scanner
+  flags:
+  - -a
+  - -trimpath
+  ldflags: 
+  - -s -w -X github.com/future-architect/vuls/config.Version={{.Version}} -X github.com/future-architect/vuls/config.Revision={{.Commit}}-{{ .CommitDate }}
   binary: trivy-to-vuls
 
 - id: future-vuls
@@ -54,61 +75,105 @@ builds:
   - CGO_ENABLED=0
   goos:
   - linux
+  - windows
+  - darwin
   goarch:
-  - 386
   - amd64
-  - arm
   - arm64
+  tags:
+  - scanner
   flags:
   - -a
-  - -tags=scanner
+  - -trimpath
+  ldflags: 
+  - -s -w -X github.com/future-architect/vuls/config.Version={{.Version}} -X github.com/future-architect/vuls/config.Revision={{.Commit}}-{{ .CommitDate }}
   main: ./contrib/future-vuls/cmd/main.go
   binary: future-vuls
+
+- id: snmp2cpe
+  env:
+  - CGO_ENABLED=0
+  goos:
+  - linux
+  - windows
+  - darwin
+  goarch:
+  - amd64
+  - arm64
+  tags:
+  - scanner
+  flags:
+  - -a
+  - -trimpath
+  ldflags: 
+  - -s -w -X github.com/future-architect/vuls/config.Version={{.Version}} -X github.com/future-architect/vuls/config.Revision={{.Commit}}-{{ .CommitDate }}
+  main: ./contrib/snmp2cpe/cmd/main.go
+  binary: snmp2cpe
 
 archives:
 
 - id: vuls
   name_template: '{{ .Binary }}_{{.Version}}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
-  builds:
+  ids:
   - vuls
-  format: tar.gz
+  formats: ['tar.gz']
   files:
   - LICENSE
-  - NOTICE
   - README*
   - CHANGELOG.md
 
 - id: vuls-scanner
   name_template: '{{ .Binary }}_{{.Version}}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
-  builds:
+  ids:
   - vuls-scanner
-  format: tar.gz
+  formats: ['tar.gz']
   files:
   - LICENSE
-  - NOTICE
   - README*
   - CHANGELOG.md
 
 - id: trivy-to-vuls
   name_template: '{{ .Binary }}_{{.Version}}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
-  builds:
+  ids:
   - trivy-to-vuls
-  format: tar.gz
+  formats: ['tar.gz']
   files:
   - LICENSE
-  - NOTICE
   - README*
   - CHANGELOG.md
 
 - id: future-vuls
   name_template: '{{ .Binary }}_{{.Version}}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
-  builds:
+  ids:
   - future-vuls
-  format: tar.gz
+  formats: ['tar.gz']
   files:
   - LICENSE
-  - NOTICE
   - README*
   - CHANGELOG.md
+
+- id: snmp2cpe
+  name_template: '{{ .Binary }}_{{.Version}}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}'
+  ids:
+  - snmp2cpe
+  formats: ['tar.gz']
+  files:
+  - LICENSE
+  - README*
+  - CHANGELOG.md
+
 snapshot:
-  name_template: SNAPSHOT-{{ .Commit }}
+  version_template: SNAPSHOT-{{ .Commit }}
+
+signs:
+- cmd: cosign
+  env:
+  - COSIGN_EXPERIMENTAL=1
+  signature: "${artifact}.sigstore.json"
+  args:
+  - "sign-blob"
+  - "--bundle=${signature}"
+  - "${artifact}"
+  - "--yes"
+  artifacts: all
+  output: true

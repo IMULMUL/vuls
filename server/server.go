@@ -1,4 +1,4 @@
-// +build !scanner
+//go:build !scanner
 
 package server
 
@@ -11,97 +11,131 @@ import (
 	"net/http"
 	"time"
 
-	c "github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/detector"
+	"github.com/future-architect/vuls/detector/vuls2"
+	"github.com/future-architect/vuls/logging"
 	"github.com/future-architect/vuls/models"
-	"github.com/future-architect/vuls/report"
-	"github.com/future-architect/vuls/scan"
-	"github.com/future-architect/vuls/util"
+	"github.com/future-architect/vuls/reporter"
+	"github.com/future-architect/vuls/scanner"
 )
 
 // VulsHandler is used for vuls server mode
 type VulsHandler struct {
-	DBclient report.DBClient
+	ToLocalFile bool
 }
 
 // ServeHTTP is http handler
 func (h VulsHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	var err error
-	result := models.ScanResult{ScannedCves: models.VulnInfos{}}
+	r := models.ScanResult{ScannedCves: models.VulnInfos{}}
 
 	contentType := req.Header.Get("Content-Type")
 	mediatype, _, err := mime.ParseMediaType(contentType)
 	if err != nil {
-		util.Log.Error(err)
+		logging.Log.Error(err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
-	if mediatype == "application/json" {
-		if err = json.NewDecoder(req.Body).Decode(&result); err != nil {
-			util.Log.Error(err)
+	switch mediatype {
+	case "application/json":
+		if err = json.NewDecoder(req.Body).Decode(&r); err != nil {
+			logging.Log.Error(err)
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
-	} else if mediatype == "text/plain" {
+	case "text/plain":
 		buf := new(bytes.Buffer)
 		if _, err := io.Copy(buf, req.Body); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if result, err = scan.ViaHTTP(req.Header, buf.String()); err != nil {
-			util.Log.Error(err)
+		if r, err = scanner.ViaHTTP(req.Header, buf.String(), h.ToLocalFile); err != nil {
+			logging.Log.Error(err)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-	} else {
-		util.Log.Error(mediatype)
+	default:
+		logging.Log.Error(mediatype)
 		http.Error(w, fmt.Sprintf("Invalid Content-Type: %s", contentType), http.StatusUnsupportedMediaType)
 		return
 	}
 
-	if err := report.DetectPkgCves(h.DBclient, &result); err != nil {
-		util.Log.Errorf("Failed to detect Pkg CVE: %+v", err)
+	// Share one lazily-opened vuls2 db session across this request's package
+	// detection and the enrichment that follows, so the read cache detection
+	// warms is reused by enrichment rather than opened and rebuilt twice.
+	sesh := vuls2.NewSession(config.Conf.Vuls2, config.Conf.NoProgress)
+	defer sesh.Close()
+
+	if err := detector.DetectPkgCves(&r, sesh); err != nil {
+		logging.Log.Errorf("Failed to detect Pkg CVE: %+v", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	if err := report.FillCveInfo(h.DBclient, &result); err != nil {
-		util.Log.Errorf("Failed to fill CVE detailed info: %+v", err)
+	if err := vuls2.EnrichVulnInfos(&r, sesh); err != nil {
+		logging.Log.Errorf("Failed to enrich vulnerability data with vuls2: %+v", err)
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
 	// set ReportedAt to current time when it's set to the epoch, ensures that ReportedAt will be set
 	// properly for scans sent to vuls when running in server mode
-	if result.ReportedAt.IsZero() {
-		result.ReportedAt = time.Now()
+	if r.ReportedAt.IsZero() {
+		r.ReportedAt = time.Now()
+	}
+
+	nFiltered := 0
+	logging.Log.Infof("%s: total %d CVEs detected", r.FormatServerName(), len(r.ScannedCves))
+
+	if 0 < config.Conf.CvssScoreOver {
+		r.ScannedCves, nFiltered = r.ScannedCves.FilterByCvssOver(config.Conf.CvssScoreOver)
+		logging.Log.Infof("%s: %d CVEs filtered by --cvss-over=%g", r.FormatServerName(), nFiltered, config.Conf.CvssScoreOver)
+	}
+
+	if 0 < config.Conf.ConfidenceScoreOver {
+		r.ScannedCves, nFiltered = r.ScannedCves.FilterByConfidenceOver(config.Conf.ConfidenceScoreOver)
+		logging.Log.Infof("%s: %d CVEs filtered by --confidence-over=%d", r.FormatServerName(), nFiltered, config.Conf.ConfidenceScoreOver)
+	}
+
+	if config.Conf.IgnoreUnscoredCves {
+		r.ScannedCves, nFiltered = r.ScannedCves.FindScoredVulns()
+		logging.Log.Infof("%s: %d CVEs filtered by --ignore-unscored-cves", r.FormatServerName(), nFiltered)
+	}
+
+	if config.Conf.IgnoreUnfixed {
+		r.ScannedCves, nFiltered = r.ScannedCves.FilterUnfixed(config.Conf.IgnoreUnfixed)
+		logging.Log.Infof("%s: %d CVEs filtered by --ignore-unfixed", r.FormatServerName(), nFiltered)
 	}
 
 	// report
-	reports := []report.ResultWriter{
-		report.HTTPResponseWriter{Writer: w},
+	reports := []reporter.ResultWriter{
+		reporter.HTTPResponseWriter{Writer: w},
 	}
-	if c.Conf.ToLocalFile {
-		scannedAt := result.ScannedAt
+	if h.ToLocalFile {
+		scannedAt := r.ScannedAt
 		if scannedAt.IsZero() {
 			scannedAt = time.Now().Truncate(1 * time.Hour)
-			result.ScannedAt = scannedAt
+			r.ScannedAt = scannedAt
 		}
-		dir, err := scan.EnsureResultDir(scannedAt)
+		dir, err := scanner.EnsureResultDir(config.Conf.ResultsDir, scannedAt)
 		if err != nil {
-			util.Log.Errorf("Failed to ensure the result directory: %+v", err)
+			logging.Log.Errorf("Failed to ensure the result directory: %+v", err)
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
 
-		reports = append(reports, report.LocalFileWriter{
+		// server subcmd doesn't have diff option
+		reports = append(reports, reporter.LocalFileWriter{
 			CurrentDir: dir,
+			FormatJSON: true,
 		})
 	}
 
 	for _, w := range reports {
-		if err := w.Write(result); err != nil {
-			util.Log.Errorf("Failed to report. err: %+v", err)
+		if err := w.Write(r); err != nil {
+			logging.Log.Errorf("Failed to report. err: %+v", err)
 			return
 		}
 	}

@@ -3,6 +3,7 @@ package models
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestTitles(t *testing.T) {
@@ -20,19 +21,19 @@ func TestTitles(t *testing.T) {
 				lang: "ja",
 				cont: VulnInfo{
 					CveContents: CveContents{
-						Jvn: {
+						Jvn: []CveContent{{
 							Type:  Jvn,
 							Title: "Title1",
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:    RedHat,
 							Summary: "Summary RedHat",
-						},
-						Nvd: {
+						}},
+						Nvd: []CveContent{{
 							Type:    Nvd,
 							Summary: "Summary NVD",
 							// Severity is NOT included in NVD
-						},
+						}},
 					},
 				},
 			},
@@ -57,19 +58,19 @@ func TestTitles(t *testing.T) {
 				lang: "en",
 				cont: VulnInfo{
 					CveContents: CveContents{
-						Jvn: {
+						Jvn: []CveContent{{
 							Type:  Jvn,
 							Title: "Title1",
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:    RedHat,
 							Summary: "Summary RedHat",
-						},
-						Nvd: {
+						}},
+						Nvd: []CveContent{{
 							Type:    Nvd,
 							Summary: "Summary NVD",
 							// Severity is NOT included in NVD
-						},
+						}},
 					},
 				},
 			},
@@ -121,20 +122,20 @@ func TestSummaries(t *testing.T) {
 				lang: "ja",
 				cont: VulnInfo{
 					CveContents: CveContents{
-						Jvn: {
+						Jvn: []CveContent{{
 							Type:    Jvn,
 							Title:   "Title JVN",
 							Summary: "Summary JVN",
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:    RedHat,
 							Summary: "Summary RedHat",
-						},
-						Nvd: {
+						}},
+						Nvd: []CveContent{{
 							Type:    Nvd,
 							Summary: "Summary NVD",
 							// Severity is NOT included in NVD
-						},
+						}},
 					},
 				},
 			},
@@ -159,20 +160,20 @@ func TestSummaries(t *testing.T) {
 				lang: "en",
 				cont: VulnInfo{
 					CveContents: CveContents{
-						Jvn: {
+						Jvn: []CveContent{{
 							Type:    Jvn,
 							Title:   "Title JVN",
 							Summary: "Summary JVN",
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:    RedHat,
 							Summary: "Summary RedHat",
-						},
-						Nvd: {
+						}},
+						Nvd: []CveContent{{
 							Type:    Nvd,
 							Summary: "Summary NVD",
 							// Severity is NOT included in NVD
-						},
+						}},
 					},
 				},
 			},
@@ -219,32 +220,32 @@ func TestCountGroupBySeverity(t *testing.T) {
 				"CVE-2017-0002": {
 					CveID: "CVE-2017-0002",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss3Score: 6.0,
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 7.0,
-						},
+						}},
 					},
 				},
 				"CVE-2017-0003": {
 					CveID: "CVE-2017-0003",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss3Score: 2.0,
-						},
+						}},
 					},
 				},
 				"CVE-2017-0004": {
 					CveID: "CVE-2017-0004",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss3Score: 5.0,
-						},
+						}},
 					},
 				},
 				"CVE-2017-0005": {
@@ -253,10 +254,10 @@ func TestCountGroupBySeverity(t *testing.T) {
 				"CVE-2017-0006": {
 					CveID: "CVE-2017-0005",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss3Score: 10.0,
-						},
+						}},
 					},
 				},
 			},
@@ -273,32 +274,32 @@ func TestCountGroupBySeverity(t *testing.T) {
 				"CVE-2017-0002": {
 					CveID: "CVE-2017-0002",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 1.0,
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 7.0,
-						},
+						}},
 					},
 				},
 				"CVE-2017-0003": {
 					CveID: "CVE-2017-0003",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 2.0,
-						},
+						}},
 					},
 				},
 				"CVE-2017-0004": {
 					CveID: "CVE-2017-0004",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 5.0,
-						},
+						}},
 					},
 				},
 				"CVE-2017-0005": {
@@ -307,10 +308,10 @@ func TestCountGroupBySeverity(t *testing.T) {
 				"CVE-2017-0006": {
 					CveID: "CVE-2017-0005",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 10.0,
-						},
+						}},
 					},
 				},
 			},
@@ -345,27 +346,27 @@ func TestToSortedSlice(t *testing.T) {
 				"CVE-2017-0002": {
 					CveID: "CVE-2017-0002",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 6.0,
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 7.0,
-						},
+						}},
 					},
 				},
 				"CVE-2017-0001": {
 					CveID: "CVE-2017-0001",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 7.0,
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 8.0,
-						},
+						}},
 					},
 				},
 			},
@@ -373,27 +374,27 @@ func TestToSortedSlice(t *testing.T) {
 				{
 					CveID: "CVE-2017-0001",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 7.0,
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 8.0,
-						},
+						}},
 					},
 				},
 				{
 					CveID: "CVE-2017-0002",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 6.0,
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 7.0,
-						},
+						}},
 					},
 				},
 			},
@@ -404,23 +405,23 @@ func TestToSortedSlice(t *testing.T) {
 				"CVE-2017-0002": {
 					CveID: "CVE-2017-0002",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 6.0,
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 7.0,
-						},
+						}},
 					},
 				},
 				"CVE-2017-0001": {
 					CveID: "CVE-2017-0001",
 					CveContents: CveContents{
-						RedHat: {
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 7.0,
-						},
+						}},
 					},
 				},
 			},
@@ -428,23 +429,23 @@ func TestToSortedSlice(t *testing.T) {
 				{
 					CveID: "CVE-2017-0001",
 					CveContents: CveContents{
-						RedHat: {
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 7.0,
-						},
+						}},
 					},
 				},
 				{
 					CveID: "CVE-2017-0002",
 					CveContents: CveContents{
-						Nvd: {
+						Nvd: []CveContent{{
 							Type:       Nvd,
 							Cvss2Score: 6.0,
-						},
-						RedHat: {
+						}},
+						RedHat: []CveContent{{
 							Type:       RedHat,
 							Cvss3Score: 7.0,
-						},
+						}},
 					},
 				},
 			},
@@ -455,19 +456,19 @@ func TestToSortedSlice(t *testing.T) {
 				"CVE-2017-0002": {
 					CveID: "CVE-2017-0002",
 					CveContents: CveContents{
-						Ubuntu: {
+						Ubuntu: []CveContent{{
 							Type:          Ubuntu,
 							Cvss3Severity: "High",
-						},
+						}},
 					},
 				},
 				"CVE-2017-0001": {
 					CveID: "CVE-2017-0001",
 					CveContents: CveContents{
-						Ubuntu: {
+						Ubuntu: []CveContent{{
 							Type:          Ubuntu,
 							Cvss3Severity: "Low",
-						},
+						}},
 					},
 				},
 			},
@@ -475,19 +476,19 @@ func TestToSortedSlice(t *testing.T) {
 				{
 					CveID: "CVE-2017-0002",
 					CveContents: CveContents{
-						Ubuntu: {
+						Ubuntu: []CveContent{{
 							Type:          Ubuntu,
 							Cvss3Severity: "High",
-						},
+						}},
 					},
 				},
 				{
 					CveID: "CVE-2017-0001",
 					CveContents: CveContents{
-						Ubuntu: {
+						Ubuntu: []CveContent{{
 							Type:          Ubuntu,
 							Cvss3Severity: "Low",
-						},
+						}},
 					},
 				},
 			},
@@ -506,34 +507,58 @@ func TestCvss2Scores(t *testing.T) {
 		in  VulnInfo
 		out []CveContentCvss
 	}{
+		// Solaris: older Oracle advisories carry CVSS v2 base scores
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Jvn: {
+					Solaris: []CveContent{{
+						Type:          Solaris,
+						Cvss2Severity: "MEDIUM",
+						Cvss2Score:    5.0,
+						Cvss2Vector:   "AV:N/AC:L/Au:N/C:P/I:N/A:N",
+					}},
+				},
+			},
+			out: []CveContentCvss{
+				{
+					Type: Solaris,
+					Value: Cvss{
+						Type:     CVSS2,
+						Score:    5.0,
+						Vector:   "AV:N/AC:L/Au:N/C:P/I:N/A:N",
+						Severity: "MEDIUM",
+					},
+				},
+			},
+		},
+		{
+			in: VulnInfo{
+				CveContents: CveContents{
+					Jvn: []CveContent{{
 						Type:          Jvn,
 						Cvss2Severity: "HIGH",
 						Cvss2Score:    8.2,
 						Cvss2Vector:   "AV:N/AC:L/Au:N/C:N/I:N/A:P",
-					},
-					RedHat: {
+					}},
+					RedHat: []CveContent{{
 						Type:          RedHat,
 						Cvss2Severity: "HIGH",
 						Cvss2Score:    8.0,
 						Cvss2Vector:   "AV:N/AC:L/Au:N/C:N/I:N/A:P",
-					},
-					Nvd: {
+					}},
+					Nvd: []CveContent{{
 						Type:          Nvd,
 						Cvss2Score:    8.1,
 						Cvss2Vector:   "AV:N/AC:L/Au:N/C:N/I:N/A:P",
 						Cvss2Severity: "HIGH",
-					},
+					}},
 					//v3
-					RedHatAPI: {
+					RedHatAPI: []CveContent{{
 						Type:          RedHatAPI,
 						Cvss3Score:    8.1,
 						Cvss3Vector:   "AV:N/AC:L/Au:N/C:N/I:N/A:P",
 						Cvss3Severity: "HIGH",
-					},
+					}},
 				},
 			},
 			out: []CveContentCvss{
@@ -589,24 +614,24 @@ func TestMaxCvss2Scores(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Jvn: {
+					Jvn: []CveContent{{
 						Type:          Jvn,
 						Cvss2Severity: "HIGH",
 						Cvss2Score:    8.2,
 						Cvss2Vector:   "AV:N/AC:L/Au:N/C:N/I:N/A:P",
-					},
-					RedHat: {
+					}},
+					RedHat: []CveContent{{
 						Type:          RedHat,
 						Cvss2Severity: "HIGH",
 						Cvss2Score:    8.0,
 						Cvss2Vector:   "AV:N/AC:L/Au:N/C:N/I:N/A:P",
-					},
-					Nvd: {
+					}},
+					Nvd: []CveContent{{
 						Type:        Nvd,
 						Cvss2Score:  8.1,
 						Cvss2Vector: "AV:N/AC:L/Au:N/C:N/I:N/A:P",
 						// Severity is NOT included in NVD
-					},
+					}},
 				},
 			},
 			out: CveContentCvss{
@@ -646,21 +671,45 @@ func TestCvss3Scores(t *testing.T) {
 		in  VulnInfo
 		out []CveContentCvss
 	}{
+		// Solaris: Oracle's advisories carry CVSS v3 base scores
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					RedHat: {
+					Solaris: []CveContent{{
+						Type:          Solaris,
+						Cvss3Severity: "HIGH",
+						Cvss3Score:    7.5,
+						Cvss3Vector:   "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+					}},
+				},
+			},
+			out: []CveContentCvss{
+				{
+					Type: Solaris,
+					Value: Cvss{
+						Type:     CVSS3,
+						Score:    7.5,
+						Vector:   "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+						Severity: "HIGH",
+					},
+				},
+			},
+		},
+		{
+			in: VulnInfo{
+				CveContents: CveContents{
+					RedHat: []CveContent{{
 						Type:          RedHat,
 						Cvss3Severity: "HIGH",
 						Cvss3Score:    8.0,
 						Cvss3Vector:   "AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L",
-					},
-					Nvd: {
+					}},
+					Nvd: []CveContent{{
 						Type:          Nvd,
 						Cvss2Score:    8.1,
 						Cvss2Vector:   "AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L",
 						Cvss2Severity: "HIGH",
-					},
+					}},
 				},
 			},
 			out: []CveContentCvss{
@@ -679,10 +728,10 @@ func TestCvss3Scores(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Ubuntu: {
+					Ubuntu: []CveContent{{
 						Type:          Ubuntu,
 						Cvss3Severity: "HIGH",
-					},
+					}},
 				},
 			},
 			out: []CveContentCvss{
@@ -696,6 +745,26 @@ func TestCvss3Scores(t *testing.T) {
 					},
 				},
 			},
+		},
+		// [2] Multiple Severities in Debian Security Tracker
+		{
+			in: VulnInfo{
+				CveContents: CveContents{
+					DebianSecurityTracker: []CveContent{{
+						Type:          DebianSecurityTracker,
+						Cvss3Severity: "not yet assigned|low",
+					}},
+				},
+			},
+			out: []CveContentCvss{{
+				Type: DebianSecurityTracker,
+				Value: Cvss{
+					Type:                 CVSS3,
+					Score:                3.9,
+					CalculatedBySeverity: true,
+					Severity:             "NOT YET ASSIGNED|LOW",
+				},
+			}},
 		},
 		// Empty
 		{
@@ -719,12 +788,12 @@ func TestMaxCvss3Scores(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					RedHat: {
+					RedHat: []CveContent{{
 						Type:          RedHat,
 						Cvss3Severity: "HIGH",
 						Cvss3Score:    8.0,
 						Cvss3Vector:   "AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L",
-					},
+					}},
 				},
 			},
 			out: CveContentCvss{
@@ -734,6 +803,25 @@ func TestMaxCvss3Scores(t *testing.T) {
 					Score:    8.0,
 					Vector:   "AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:L/A:L",
 					Severity: "HIGH",
+				},
+			},
+		},
+		{
+			in: VulnInfo{
+				CveContents: CveContents{
+					TrivyRapidFort: []CveContent{{
+						Type:          TrivyRapidFort,
+						Cvss3Severity: "HIGH",
+					}},
+				},
+			},
+			out: CveContentCvss{
+				Type: TrivyRapidFort,
+				Value: Cvss{
+					Type:                 CVSS3,
+					Score:                8.9,
+					CalculatedBySeverity: true,
+					Severity:             "HIGH",
 				},
 			},
 		},
@@ -767,14 +855,14 @@ func TestMaxCvssScores(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Nvd: {
+					Nvd: []CveContent{{
 						Type:       Nvd,
 						Cvss3Score: 7.0,
-					},
-					RedHat: {
+					}},
+					RedHat: []CveContent{{
 						Type:       RedHat,
 						Cvss2Score: 8.0,
-					},
+					}},
 				},
 			},
 			out: CveContentCvss{
@@ -788,10 +876,10 @@ func TestMaxCvssScores(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					RedHat: {
+					RedHat: []CveContent{{
 						Type:       RedHat,
 						Cvss3Score: 8.0,
-					},
+					}},
 				},
 			},
 			out: CveContentCvss{
@@ -806,10 +894,10 @@ func TestMaxCvssScores(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Ubuntu: {
+					Ubuntu: []CveContent{{
 						Type:          Ubuntu,
 						Cvss3Severity: "HIGH",
-					},
+					}},
 				},
 			},
 			out: CveContentCvss{
@@ -826,15 +914,15 @@ func TestMaxCvssScores(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Ubuntu: {
+					Ubuntu: []CveContent{{
 						Type:          Ubuntu,
 						Cvss3Severity: "MEDIUM",
-					},
-					Nvd: {
+					}},
+					Nvd: []CveContent{{
 						Type:          Nvd,
 						Cvss2Score:    7.0,
 						Cvss2Severity: "HIGH",
-					},
+					}},
 				},
 			},
 			out: CveContentCvss{
@@ -870,15 +958,15 @@ func TestMaxCvssScores(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Ubuntu: {
+					Ubuntu: []CveContent{{
 						Type:          Ubuntu,
 						Cvss3Severity: "MEDIUM",
-					},
-					Nvd: {
+					}},
+					Nvd: []CveContent{{
 						Type:          Nvd,
 						Cvss2Score:    4.0,
 						Cvss2Severity: "MEDIUM",
-					},
+					}},
 				},
 				DistroAdvisories: []DistroAdvisory{
 					{
@@ -893,6 +981,51 @@ func TestMaxCvssScores(t *testing.T) {
 					Score:                8.9,
 					Severity:             "HIGH",
 					CalculatedBySeverity: true,
+				},
+			},
+		},
+		// 6 : CVSSv4.0 and CVSSv3.1
+		{
+			in: VulnInfo{
+				CveContents: CveContents{
+					Mitre: []CveContent{
+						{
+							Type:           Mitre,
+							Cvss40Score:    6.9,
+							Cvss40Vector:   "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N",
+							Cvss40Severity: "MEDIUM",
+							Cvss3Score:     7.3,
+							Cvss3Vector:    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L",
+							Cvss3Severity:  "HIGH",
+							Optional:       map[string]string{"source": "CNA"},
+						},
+					},
+					Nvd: []CveContent{
+						{
+							Type:          Nvd,
+							Cvss3Score:    9.8,
+							Cvss3Vector:   "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+							Cvss3Severity: "CRITICAL",
+							Optional:      map[string]string{"source": "nvd@nist.gov"},
+						},
+						{
+							Type:          Nvd,
+							Cvss3Score:    7.3,
+							Cvss3Vector:   "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L",
+							Cvss3Severity: "HIGH",
+							Optional:      map[string]string{"source": "cna@vuldb.com"},
+						},
+					},
+				},
+			},
+			out: CveContentCvss{
+				Type:   Mitre,
+				Source: "CNA",
+				Value: Cvss{
+					Type:     CVSS40,
+					Score:    6.9,
+					Severity: "MEDIUM",
+					Vector:   "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N",
 				},
 			},
 		},
@@ -916,6 +1049,37 @@ func TestMaxCvssScores(t *testing.T) {
 	}
 }
 
+func TestCveContentCvss_Label(t *testing.T) {
+	tests := []struct {
+		name string
+		in   CveContentCvss
+		want string
+	}{
+		{
+			name: "no source",
+			in:   CveContentCvss{Type: RedHatAPI},
+			want: "redhat_api",
+		},
+		{
+			name: "nvd's own metrics",
+			in:   CveContentCvss{Type: Nvd, Source: "nvd@nist.gov"},
+			want: "nvd(nvd@nist.gov)",
+		},
+		{
+			name: "mitre adp container",
+			in:   CveContentCvss{Type: Mitre, Source: "ADP:CISA-ADP"},
+			want: "mitre(ADP:CISA-ADP)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.in.Label(); got != tt.want {
+				t.Errorf("CveContentCvss.Label() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestFormatMaxCvssScore(t *testing.T) {
 	var tests = []struct {
 		in  VulnInfo
@@ -924,21 +1088,21 @@ func TestFormatMaxCvssScore(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Jvn: {
+					Jvn: []CveContent{{
 						Type:          Jvn,
 						Cvss2Severity: "HIGH",
 						Cvss2Score:    8.3,
-					},
-					RedHat: {
+					}},
+					RedHat: []CveContent{{
 						Type:          RedHat,
 						Cvss3Severity: "HIGH",
 						Cvss3Score:    8.0,
-					},
-					Nvd: {
+					}},
+					Nvd: []CveContent{{
 						Type:       Nvd,
 						Cvss2Score: 8.1,
 						// Severity is NOT included in NVD
-					},
+					}},
 				},
 			},
 			out: "8.0 HIGH (redhat)",
@@ -946,25 +1110,48 @@ func TestFormatMaxCvssScore(t *testing.T) {
 		{
 			in: VulnInfo{
 				CveContents: CveContents{
-					Jvn: {
+					Jvn: []CveContent{{
 						Type:          Jvn,
 						Cvss2Severity: "HIGH",
 						Cvss2Score:    8.3,
-					},
-					RedHat: {
+					}},
+					RedHat: []CveContent{{
 						Type:          RedHat,
 						Cvss2Severity: "HIGH",
 						Cvss2Score:    8.0,
 						Cvss3Severity: "HIGH",
 						Cvss3Score:    9.9,
-					},
-					Nvd: {
+					}},
+					Nvd: []CveContent{{
 						Type:       Nvd,
 						Cvss2Score: 8.1,
-					},
+					}},
 				},
 			},
 			out: "9.9 HIGH (redhat)",
+		},
+		{
+			// The max comes from a per-source nvd content, so the source is
+			// named alongside the type.
+			in: VulnInfo{
+				CveContents: CveContents{
+					Nvd: []CveContent{
+						{
+							Type:          Nvd,
+							Cvss3Score:    7.5,
+							Cvss3Severity: "HIGH",
+							Optional:      map[string]string{"source": "nvd@nist.gov"},
+						},
+						{
+							Type:          Nvd,
+							Cvss3Score:    5.3,
+							Cvss3Severity: "MEDIUM",
+							Optional:      map[string]string{"source": "openssl-security@openssl.org"},
+						},
+					},
+				},
+			},
+			out: "7.5 HIGH (nvd, nvd@nist.gov)",
 		},
 	}
 	for i, tt := range tests {
@@ -988,6 +1175,28 @@ func TestSortPackageStatues(t *testing.T) {
 			out: PackageFixStatuses{
 				{Name: "a"},
 				{Name: "b"},
+			},
+		},
+		{
+			in: PackageFixStatuses{
+				{
+					Name:    "libzstd1",
+					FixedIn: "1.3.1+dfsg-1~ubuntu0.16.04.1+esm1",
+				},
+				{
+					Name:    "libzstd1",
+					FixedIn: "1.3.1+dfsg-1~ubuntu0.16.04.1+esm2",
+				},
+			},
+			out: PackageFixStatuses{
+				{
+					Name:    "libzstd1",
+					FixedIn: "1.3.1+dfsg-1~ubuntu0.16.04.1+esm2",
+				},
+				{
+					Name:    "libzstd1",
+					FixedIn: "1.3.1+dfsg-1~ubuntu0.16.04.1+esm1",
+				},
 			},
 		},
 	}
@@ -1036,20 +1245,20 @@ func TestAppendIfMissing(t *testing.T) {
 	}{
 		{
 			in: Confidences{
-				CpeNameMatch,
+				NvdExactVersionMatch,
 			},
-			arg: CpeNameMatch,
+			arg: NvdExactVersionMatch,
 			out: Confidences{
-				CpeNameMatch,
+				NvdExactVersionMatch,
 			},
 		},
 		{
 			in: Confidences{
-				CpeNameMatch,
+				NvdExactVersionMatch,
 			},
 			arg: ChangelogExactMatch,
 			out: Confidences{
-				CpeNameMatch,
+				NvdExactVersionMatch,
 				ChangelogExactMatch,
 			},
 		},
@@ -1070,21 +1279,21 @@ func TestSortByConfident(t *testing.T) {
 		{
 			in: Confidences{
 				OvalMatch,
-				CpeNameMatch,
+				NvdExactVersionMatch,
 			},
 			out: Confidences{
 				OvalMatch,
-				CpeNameMatch,
+				NvdExactVersionMatch,
 			},
 		},
 		{
 			in: Confidences{
-				CpeNameMatch,
+				NvdExactVersionMatch,
 				OvalMatch,
 			},
 			out: Confidences{
 				OvalMatch,
-				CpeNameMatch,
+				NvdExactVersionMatch,
 			},
 		},
 	}
@@ -1153,6 +1362,87 @@ func TestDistroAdvisories_AppendIfMissing(t *testing.T) {
 			}
 			if !reflect.DeepEqual(tt.advs, tt.after) {
 				t.Errorf("\nexpected: %v\n  actual: %v\n", tt.after, tt.advs)
+			}
+		})
+	}
+}
+
+func TestExploits_AppendIfMissing(t *testing.T) {
+	type args struct {
+		exploit Exploit
+	}
+	tests := []struct {
+		name  string
+		es    Exploits
+		args  args
+		after Exploits
+	}{
+		{
+			name: "append when missing",
+			es:   Exploits{{ExploitType: ExploitTypeNVD, URL: "https://example.com/a"}},
+			args: args{exploit: Exploit{ExploitType: ExploitTypeNVD, URL: "https://example.com/b"}},
+			after: Exploits{
+				{ExploitType: ExploitTypeNVD, URL: "https://example.com/a"},
+				{ExploitType: ExploitTypeNVD, URL: "https://example.com/b"},
+			},
+		},
+		{
+			name:  "same key keeps first",
+			es:    Exploits{{ExploitType: ExploitTypeNVD, URL: "https://example.com/a", Description: "first"}},
+			args:  args{exploit: Exploit{ExploitType: ExploitTypeNVD, URL: "https://example.com/a", Description: "second"}},
+			after: Exploits{{ExploitType: ExploitTypeNVD, URL: "https://example.com/a", Description: "first"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.es.AppendIfMissing(tt.args.exploit)
+			if !reflect.DeepEqual(tt.es, tt.after) {
+				t.Errorf("\nexpected: %v\n  actual: %v\n", tt.after, tt.es)
+			}
+		})
+	}
+}
+
+func TestMitigations_AppendIfMissing(t *testing.T) {
+	type args struct {
+		mitigation Mitigation
+	}
+	tests := []struct {
+		name  string
+		ms    Mitigations
+		args  args
+		after Mitigations
+	}{
+		{
+			name: "append when missing",
+			ms:   Mitigations{{CveContentType: Nvd, URL: "https://example.com/a"}},
+			args: args{mitigation: Mitigation{CveContentType: Nvd, URL: "https://example.com/b"}},
+			after: Mitigations{
+				{CveContentType: Nvd, URL: "https://example.com/a"},
+				{CveContentType: Nvd, URL: "https://example.com/b"},
+			},
+		},
+		{
+			name:  "same key keeps first",
+			ms:    Mitigations{{CveContentType: Nvd, URL: "https://example.com/a", Mitigation: "first"}},
+			args:  args{mitigation: Mitigation{CveContentType: Nvd, URL: "https://example.com/a", Mitigation: "first"}},
+			after: Mitigations{{CveContentType: Nvd, URL: "https://example.com/a", Mitigation: "first"}},
+		},
+		{
+			name: "different mitigation text is a distinct entry",
+			ms:   Mitigations{{CveContentType: Nvd, URL: "https://example.com/a", Mitigation: "first"}},
+			args: args{mitigation: Mitigation{CveContentType: Nvd, URL: "https://example.com/a", Mitigation: "second"}},
+			after: Mitigations{
+				{CveContentType: Nvd, URL: "https://example.com/a", Mitigation: "first"},
+				{CveContentType: Nvd, URL: "https://example.com/a", Mitigation: "second"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.ms.AppendIfMissing(tt.args.mitigation)
+			if !reflect.DeepEqual(tt.ms, tt.after) {
+				t.Errorf("\nexpected: %v\n  actual: %v\n", tt.after, tt.ms)
 			}
 		})
 	}
@@ -1236,6 +1526,851 @@ func TestVulnInfo_AttackVector(t *testing.T) {
 			}
 			if got := v.AttackVector(); got != tt.want {
 				t.Errorf("VulnInfo.AttackVector() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVulnInfos_FilterByCvssOver(t *testing.T) {
+	type args struct {
+		over float64
+	}
+	tests := []struct {
+		name  string
+		v     VulnInfos
+		args  args
+		want  VulnInfos
+		nwant int
+	}{
+		{
+			name: "over 7.0",
+			args: args{over: 7.0},
+			v: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:         Nvd,
+							CveID:        "CVE-2017-0001",
+							Cvss2Score:   7.1,
+							LastModified: time.Time{},
+						},
+					),
+				},
+				"CVE-2017-0002": {
+					CveID: "CVE-2017-0002",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:         Nvd,
+							CveID:        "CVE-2017-0002",
+							Cvss2Score:   6.9,
+							LastModified: time.Time{},
+						},
+					),
+				},
+				"CVE-2017-0003": {
+					CveID: "CVE-2017-0003",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:         Nvd,
+							CveID:        "CVE-2017-0003",
+							Cvss2Score:   6.9,
+							LastModified: time.Time{},
+						},
+						CveContent{
+							Type:         Jvn,
+							CveID:        "CVE-2017-0003",
+							Cvss2Score:   7.2,
+							LastModified: time.Time{},
+						},
+					),
+				},
+			},
+			nwant: 1,
+			want: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:         Nvd,
+							CveID:        "CVE-2017-0001",
+							Cvss2Score:   7.1,
+							LastModified: time.Time{},
+						},
+					),
+				},
+				"CVE-2017-0003": {
+					CveID: "CVE-2017-0003",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:         Nvd,
+							CveID:        "CVE-2017-0003",
+							Cvss2Score:   6.9,
+							LastModified: time.Time{},
+						},
+						CveContent{
+							Type:         Jvn,
+							CveID:        "CVE-2017-0003",
+							Cvss2Score:   7.2,
+							LastModified: time.Time{},
+						},
+					),
+				},
+			},
+		},
+		{
+			name: "over high",
+			args: args{over: 7.0},
+			v: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:          Ubuntu,
+							CveID:         "CVE-2017-0001",
+							Cvss3Severity: "HIGH",
+							LastModified:  time.Time{},
+						},
+					),
+				},
+				"CVE-2017-0002": {
+					CveID: "CVE-2017-0002",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:          Debian,
+							CveID:         "CVE-2017-0002",
+							Cvss3Severity: "CRITICAL",
+							LastModified:  time.Time{},
+						},
+					),
+				},
+				"CVE-2017-0003": {
+					CveID: "CVE-2017-0003",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:          GitHub,
+							CveID:         "CVE-2017-0003",
+							Cvss3Severity: "IMPORTANT",
+							LastModified:  time.Time{},
+						},
+					),
+				},
+			},
+			want: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:          Ubuntu,
+							CveID:         "CVE-2017-0001",
+							Cvss3Severity: "HIGH",
+							LastModified:  time.Time{},
+						},
+					),
+				},
+				"CVE-2017-0002": {
+					CveID: "CVE-2017-0002",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:          Debian,
+							CveID:         "CVE-2017-0002",
+							Cvss3Severity: "CRITICAL",
+							LastModified:  time.Time{},
+						},
+					),
+				},
+				"CVE-2017-0003": {
+					CveID: "CVE-2017-0003",
+					CveContents: NewCveContents(
+						CveContent{
+							Type:          GitHub,
+							CveID:         "CVE-2017-0003",
+							Cvss3Severity: "IMPORTANT",
+							LastModified:  time.Time{},
+						},
+					),
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ngot := tt.v.FilterByCvssOver(tt.args.over)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("VulnInfos.FindByCvssOver() = %v, want %v", got, tt.want)
+			}
+			if ngot != tt.nwant {
+				t.Errorf("VulnInfos.FindByCvssOver() = %d, want %d", ngot, tt.nwant)
+			}
+		})
+	}
+}
+
+func TestVulnInfos_FilterIgnoreCves(t *testing.T) {
+	type args struct {
+		ignoreCveIDs []string
+	}
+	tests := []struct {
+		name  string
+		v     VulnInfos
+		args  args
+		want  VulnInfos
+		nwant int
+	}{
+		{
+			name: "filter ignored",
+			args: args{ignoreCveIDs: []string{"CVE-2017-0002"}},
+			v: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+				},
+				"CVE-2017-0002": {
+					CveID: "CVE-2017-0002",
+				},
+				"CVE-2017-0003": {
+					CveID: "CVE-2017-0003",
+				},
+			},
+			nwant: 1,
+			want: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+				},
+				"CVE-2017-0003": {
+					CveID: "CVE-2017-0003",
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ngot := tt.v.FilterIgnoreCves(tt.args.ignoreCveIDs)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("VulnInfos.FindIgnoreCves() = %v, want %v", got, tt.want)
+			}
+			if ngot != tt.nwant {
+				t.Errorf("VulnInfos.FindByCvssOver() = %d, want %d", ngot, tt.nwant)
+			}
+		})
+	}
+}
+
+func TestVulnInfos_FilterUnfixed(t *testing.T) {
+	type args struct {
+		ignoreUnfixed bool
+	}
+	tests := []struct {
+		name  string
+		v     VulnInfos
+		args  args
+		want  VulnInfos
+		nwant int
+	}{
+		{
+			name: "filter ok",
+			args: args{ignoreUnfixed: true},
+			v: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					AffectedPackages: PackageFixStatuses{
+						{
+							Name:        "a",
+							NotFixedYet: true,
+						},
+					},
+				},
+				"CVE-2017-0002": {
+					CveID: "CVE-2017-0002",
+					AffectedPackages: PackageFixStatuses{
+						{
+							Name:        "b",
+							NotFixedYet: false,
+						},
+					},
+				},
+				"CVE-2017-0003": {
+					CveID: "CVE-2017-0003",
+					AffectedPackages: PackageFixStatuses{
+						{
+							Name:        "c",
+							NotFixedYet: true,
+						},
+						{
+							Name:        "d",
+							NotFixedYet: false,
+						},
+					},
+				},
+			},
+			nwant: 1,
+			want: VulnInfos{
+				"CVE-2017-0002": {
+					CveID: "CVE-2017-0002",
+					AffectedPackages: PackageFixStatuses{
+						{
+							Name:        "b",
+							NotFixedYet: false,
+						},
+					},
+				},
+				"CVE-2017-0003": {
+					CveID: "CVE-2017-0003",
+					AffectedPackages: PackageFixStatuses{
+						{
+							Name:        "c",
+							NotFixedYet: true,
+						},
+						{
+							Name:        "d",
+							NotFixedYet: false,
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ngot := tt.v.FilterUnfixed(tt.args.ignoreUnfixed)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("VulnInfos.FilterUnfixed() = %v, want %v", got, tt.want)
+			}
+			if ngot != tt.nwant {
+				t.Errorf("VulnInfos.FindByCvssOver() = %d, want %d", ngot, tt.nwant)
+			}
+		})
+	}
+}
+
+func TestVulnInfos_FilterIgnorePkgs(t *testing.T) {
+	type args struct {
+		ignorePkgsRegexps []string
+	}
+	tests := []struct {
+		name  string
+		v     VulnInfos
+		args  args
+		want  VulnInfos
+		nwant int
+	}{
+		{
+			name: "filter pkgs 1",
+			args: args{ignorePkgsRegexps: []string{"^kernel"}},
+			v: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					AffectedPackages: PackageFixStatuses{
+						{Name: "kernel"},
+					},
+				},
+				"CVE-2017-0002": {
+					CveID: "CVE-2017-0002",
+				},
+			},
+			nwant: 1,
+			want: VulnInfos{
+				"CVE-2017-0002": {
+					CveID: "CVE-2017-0002",
+				},
+			},
+		},
+		{
+			name: "filter pkgs 2",
+			args: args{ignorePkgsRegexps: []string{"^kernel"}},
+			v: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					AffectedPackages: PackageFixStatuses{
+						{Name: "kernel"},
+						{Name: "vim"},
+					},
+				},
+			},
+			nwant: 0,
+			want: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					AffectedPackages: PackageFixStatuses{
+						{Name: "kernel"},
+						{Name: "vim"},
+					},
+				},
+			},
+		},
+		{
+			name: "filter pkgs 3",
+			args: args{ignorePkgsRegexps: []string{"^kernel", "^vim", "^bind"}},
+			v: VulnInfos{
+				"CVE-2017-0001": {
+					CveID: "CVE-2017-0001",
+					AffectedPackages: PackageFixStatuses{
+						{Name: "kernel"},
+						{Name: "vim"},
+					},
+				},
+			},
+			nwant: 1,
+			want:  VulnInfos{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ngot := tt.v.FilterIgnorePkgs(tt.args.ignorePkgsRegexps)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("VulnInfos.FilterIgnorePkgs() = %v, want %v", got, tt.want)
+			}
+			if ngot != tt.nwant {
+				t.Errorf("VulnInfos.FilterIgnorePkgs() = %d, want %d", ngot, tt.nwant)
+			}
+		})
+	}
+}
+
+func TestVulnInfos_FilterByConfidenceOver(t *testing.T) {
+	type args struct {
+		over int
+	}
+	tests := []struct {
+		name  string
+		v     VulnInfos
+		args  args
+		want  VulnInfos
+		nwant int
+	}{
+		{
+			name: "over 0",
+			v: map[string]VulnInfo{
+				"CVE-2021-1111": {
+					CveID:       "CVE-2021-1111",
+					Confidences: Confidences{JvnVendorProductMatch},
+				},
+			},
+			args: args{
+				over: 0,
+			},
+			want: map[string]VulnInfo{
+				"CVE-2021-1111": {
+					CveID:       "CVE-2021-1111",
+					Confidences: Confidences{JvnVendorProductMatch},
+				},
+			},
+		},
+		{
+			name: "over 20",
+			v: map[string]VulnInfo{
+				"CVE-2021-1111": {
+					CveID:       "CVE-2021-1111",
+					Confidences: Confidences{JvnVendorProductMatch},
+				},
+			},
+			args: args{
+				over: 20,
+			},
+			nwant: 1,
+			want:  map[string]VulnInfo{},
+		},
+		{
+			name: "over 100",
+			v: map[string]VulnInfo{
+				"CVE-2021-1111": {
+					CveID: "CVE-2021-1111",
+					Confidences: Confidences{
+						NvdExactVersionMatch,
+						JvnVendorProductMatch,
+					},
+				},
+			},
+			args: args{
+				over: 20,
+			},
+			want: map[string]VulnInfo{
+				"CVE-2021-1111": {
+					CveID: "CVE-2021-1111",
+					Confidences: Confidences{
+						NvdExactVersionMatch,
+						JvnVendorProductMatch,
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ngot := tt.v.FilterByConfidenceOver(tt.args.over)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("VulnInfos.FilterByConfidenceOver() = %v, want %v", got, tt.want)
+			}
+			if ngot != tt.nwant {
+				t.Errorf("VulnInfos.FilterByConfidenceOver() = %d, want %d", ngot, tt.nwant)
+			}
+		})
+	}
+}
+
+func TestVulnInfo_PatchStatus(t *testing.T) {
+	type fields struct {
+		Confidences       Confidences
+		AffectedPackages  PackageFixStatuses
+		CpeURIs           []string
+		WindowsKBFixedIns []string
+	}
+	type args struct {
+		packs Packages
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		want   string
+	}{
+		{
+			name: "cpe",
+			fields: fields{
+				CpeURIs: []string{"cpe:/a:microsoft:internet_explorer:10"},
+			},
+			want: "unknown",
+		},
+		{
+			name: "package unfixed",
+			fields: fields{
+				AffectedPackages: PackageFixStatuses{
+					{
+						Name:        "bash",
+						NotFixedYet: true,
+					},
+				},
+			},
+			want: "unfixed",
+		},
+		{
+			name: "package unknown",
+			fields: fields{
+				AffectedPackages: PackageFixStatuses{
+					{
+						Name: "bash",
+					},
+				},
+			},
+			args: args{
+				packs: Packages{"bash": {
+					Name: "bash",
+				}},
+			},
+			want: "unknown",
+		},
+		{
+			name: "package fixed",
+			fields: fields{
+				AffectedPackages: PackageFixStatuses{
+					{
+						Name: "bash",
+					},
+				},
+			},
+			args: args{
+				packs: Packages{"bash": {
+					Name:       "bash",
+					Version:    "4.3-9.1",
+					NewVersion: "5.0-4",
+				}},
+			},
+			want: "fixed",
+		},
+		{
+			name: "WindowsRoughMatch",
+			fields: fields{
+				Confidences: Confidences{WindowsRoughMatch},
+			},
+			want: "unknown",
+		},
+		{
+			name: "WindowsRoughMatch and WindowsUpdateSearch",
+			fields: fields{
+				Confidences: Confidences{WindowsRoughMatch, WindowsUpdateSearch},
+			},
+			want: "unknown",
+		},
+		{
+			name: "WindowsUpdateSearch unknown",
+			fields: fields{
+				Confidences: Confidences{WindowsUpdateSearch},
+				AffectedPackages: PackageFixStatuses{
+					{
+						Name:     "Microsoft Edge",
+						FixState: "unknown",
+					},
+				},
+			},
+			want: "unknown",
+		},
+		{
+			name: "WindowsUpdateSearch unfixed",
+			fields: fields{
+				Confidences: Confidences{WindowsUpdateSearch},
+				AffectedPackages: PackageFixStatuses{
+					{
+						Name:     "Windows 10 Version 21H2 for x64-based Systems",
+						FixState: "unfixed",
+					},
+				},
+				WindowsKBFixedIns: []string{"000000"},
+			},
+			want: "unfixed",
+		},
+		{
+			name: "WindowsUpdateSearch unfixed2",
+			fields: fields{
+				Confidences: Confidences{WindowsUpdateSearch},
+			},
+			want: "unfixed",
+		},
+		{
+			name: "WindowsUpdateSearch fixed",
+			fields: fields{
+				Confidences:       Confidences{WindowsUpdateSearch},
+				WindowsKBFixedIns: []string{"000000"},
+			},
+			want: "fixed",
+		},
+		{
+			name: "WindowsUpdateSearch fixed2",
+			fields: fields{
+				Confidences: Confidences{WindowsUpdateSearch},
+				AffectedPackages: PackageFixStatuses{
+					{
+						Name:     "Microsoft Edge",
+						FixState: "fixed",
+						FixedIn:  "128.0.2739.79",
+					},
+				},
+			},
+			want: "fixed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := VulnInfo{
+				Confidences:       tt.fields.Confidences,
+				AffectedPackages:  tt.fields.AffectedPackages,
+				CpeURIs:           tt.fields.CpeURIs,
+				WindowsKBFixedIns: tt.fields.WindowsKBFixedIns,
+			}
+			if got := v.PatchStatus(tt.args.packs); got != tt.want {
+				t.Errorf("VulnInfo.PatchStatus() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVulnInfo_Cvss40Scores(t *testing.T) {
+	type fields struct {
+		CveID       string
+		CveContents CveContents
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		want   []CveContentCvss
+	}{
+		{
+			name: "happy",
+			fields: fields{
+				CveID: "CVE-2024-5732",
+				CveContents: CveContents{
+					Mitre: []CveContent{
+						{
+							Type:           Mitre,
+							Cvss40Score:    6.9,
+							Cvss40Vector:   "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N",
+							Cvss40Severity: "MEDIUM",
+							Cvss3Score:     7.3,
+							Cvss3Vector:    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L",
+							Cvss3Severity:  "HIGH",
+							Optional:       map[string]string{"source": "CNA"},
+						},
+					},
+					Nvd: []CveContent{
+						{
+							Type:           Nvd,
+							Cvss40Score:    6.9,
+							Cvss40Vector:   "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N/E:X/CR:X/IR:X/AR:X/MAV:X/MAC:X/MAT:X/MPR:X/MUI:X/MVC:X/MVI:X/MVA:X/MSC:X/MSI:X/MSA:X/S:X/AU:X/R:X/V:X/RE:X/U:X",
+							Cvss40Severity: "MEDIUM",
+							Optional:       map[string]string{"source": "cna@vuldb.com"},
+						},
+					},
+				},
+			},
+			want: []CveContentCvss{
+				{
+					Type:   Mitre,
+					Source: "CNA",
+					Value: Cvss{
+						Type:     CVSS40,
+						Score:    6.9,
+						Severity: "MEDIUM",
+						Vector:   "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N",
+					},
+				},
+				{
+					Type:   Nvd,
+					Source: "cna@vuldb.com",
+					Value: Cvss{
+						Type:     CVSS40,
+						Score:    6.9,
+						Severity: "MEDIUM",
+						Vector:   "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N/E:X/CR:X/IR:X/AR:X/MAV:X/MAC:X/MAT:X/MPR:X/MUI:X/MVC:X/MVI:X/MVA:X/MSC:X/MSI:X/MSA:X/S:X/AU:X/R:X/V:X/RE:X/U:X",
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := (VulnInfo{
+				CveID:       tt.fields.CveID,
+				CveContents: tt.fields.CveContents,
+			}).Cvss40Scores(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("VulnInfo.Cvss40Scores() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVulnInfo_MaxCvss40Score(t *testing.T) {
+	type fields struct {
+		CveID       string
+		CveContents CveContents
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		want   CveContentCvss
+	}{
+		{
+			name: "happy",
+			fields: fields{
+				CveID: "CVE-2024-5732",
+				CveContents: CveContents{
+					Mitre: []CveContent{
+						{
+							Type:           Mitre,
+							Cvss40Score:    6.9,
+							Cvss40Vector:   "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N",
+							Cvss40Severity: "MEDIUM",
+							Cvss3Score:     7.3,
+							Cvss3Vector:    "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:L",
+							Cvss3Severity:  "HIGH",
+							Optional:       map[string]string{"source": "CNA"},
+						},
+					},
+				},
+			},
+			want: CveContentCvss{
+				Type:   Mitre,
+				Source: "CNA",
+				Value: Cvss{
+					Type:     CVSS40,
+					Score:    6.9,
+					Severity: "MEDIUM",
+					Vector:   "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:L/VA:L/SC:N/SI:N/SA:N",
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := (VulnInfo{
+				CveID:       tt.fields.CveID,
+				CveContents: tt.fields.CveContents,
+			}).MaxCvss40Score(); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("VulnInfo.MaxsCvss40Score() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestVulnInfos_FormatFixedStatus(t *testing.T) {
+	type args struct {
+		packs Packages
+	}
+	tests := []struct {
+		name string
+		v    VulnInfos
+		args args
+		want string
+	}{
+		{
+			name: "empty",
+			v:    VulnInfos{},
+			want: "0/0 Fixed",
+		},
+		{
+			name: "package fixed",
+			v: VulnInfos{
+				"CVE-2024-0001": {
+					CveID: "CVE-2024-0001",
+					AffectedPackages: PackageFixStatuses{
+						{Name: "bash", NotFixedYet: false},
+					},
+				},
+			},
+			args: args{
+				packs: Packages{"bash": {Name: "bash", Version: "5.0-4", NewVersion: "5.1-1"}},
+			},
+			want: "1/1 Fixed",
+		},
+		{
+			name: "package unfixed",
+			v: VulnInfos{
+				"CVE-2024-0001": {
+					CveID: "CVE-2024-0001",
+					AffectedPackages: PackageFixStatuses{
+						{Name: "bash", NotFixedYet: true},
+					},
+				},
+			},
+			want: "0/1 Fixed",
+		},
+		{
+			name: "cpe counted as unknown",
+			v: VulnInfos{
+				"CVE-2024-0001": {
+					CveID:   "CVE-2024-0001",
+					CpeURIs: []string{"cpe:/a:vendor:product:1.0"},
+				},
+			},
+			want: "0/1 Fixed",
+		},
+		{
+			name: "mixed: package fixed + package unfixed + cpe",
+			v: VulnInfos{
+				"CVE-2024-0001": {
+					CveID: "CVE-2024-0001",
+					AffectedPackages: PackageFixStatuses{
+						{Name: "bash", NotFixedYet: false},
+					},
+				},
+				"CVE-2024-0002": {
+					CveID: "CVE-2024-0002",
+					AffectedPackages: PackageFixStatuses{
+						{Name: "vim", NotFixedYet: true},
+					},
+				},
+				"CVE-2024-0003": {
+					CveID:   "CVE-2024-0003",
+					CpeURIs: []string{"cpe:/a:vendor:product:1.0"},
+				},
+			},
+			args: args{
+				packs: Packages{"bash": {Name: "bash", Version: "5.0-4", NewVersion: "5.1-1"}},
+			},
+			want: "1/3 Fixed",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.v.FormatFixedStatus(tt.args.packs); got != tt.want {
+				t.Errorf("VulnInfos.FormatFixedStatus() = %v, want %v", got, tt.want)
 			}
 		})
 	}

@@ -3,23 +3,22 @@ package saas
 import (
 	"bytes"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"reflect"
 	"strings"
 
 	"github.com/BurntSushi/toml"
-	c "github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/logging"
 	"github.com/future-architect/vuls/models"
-	"github.com/future-architect/vuls/util"
 	"github.com/hashicorp/go-uuid"
 	"golang.org/x/xerrors"
 )
 
 // EnsureUUIDs generate a new UUID of the scan target server if UUID is not assigned yet.
 // And then set the generated UUID to config.toml and scan results.
-func EnsureUUIDs(servers map[string]c.ServerInfo, path string, scanResults models.ScanResults) (err error) {
-	needsOverwrite, err := ensure(servers, path, scanResults, uuid.GenerateUUID)
+func EnsureUUIDs(servers map[string]config.ServerInfo, path string, scanResults models.ScanResults) (err error) {
+	needsOverwrite, err := ensure(servers, scanResults, uuid.GenerateUUID)
 	if err != nil {
 		return xerrors.Errorf("Failed to ensure UUIDs. err: %w", err)
 	}
@@ -27,10 +26,10 @@ func EnsureUUIDs(servers map[string]c.ServerInfo, path string, scanResults model
 	if !needsOverwrite {
 		return
 	}
-	return writeToFile(c.Conf, path)
+	return writeToFile(config.Conf, path)
 }
 
-func ensure(servers map[string]c.ServerInfo, path string, scanResults models.ScanResults, generateFunc func() (string, error)) (needsOverwrite bool, err error) {
+func ensure(servers map[string]config.ServerInfo, scanResults models.ScanResults, generateFunc func() (string, error)) (needsOverwrite bool, err error) {
 	for i, r := range scanResults {
 		serverInfo := servers[r.ServerName]
 		if serverInfo.UUIDs == nil {
@@ -48,7 +47,7 @@ func ensure(servers map[string]c.ServerInfo, path string, scanResults models.Sca
 				needsOverwrite = true
 			} else if _, err := uuid.ParseUUID(id); err != nil {
 				// if the UUID of the host is invalid, re-generate it
-				util.Log.Warnf("UUID `%s` is invalid. Re-generate and overwrite", id)
+				logging.Log.Warnf("UUID `%s` is invalid. Re-generate and overwrite", id)
 				serverInfo.UUIDs[r.ServerName], err = generateFunc()
 				if err != nil {
 					return false, err
@@ -74,7 +73,7 @@ func ensure(servers map[string]c.ServerInfo, path string, scanResults models.Sca
 				continue
 			}
 			// re-generate
-			util.Log.Warnf("UUID `%s` is invalid. Re-generate and overwrite", id)
+			logging.Log.Warnf("UUID `%s` is invalid. Re-generate and overwrite", id)
 		}
 
 		// Generate a new UUID and set to config and scanResult
@@ -96,7 +95,7 @@ func ensure(servers map[string]c.ServerInfo, path string, scanResults models.Sca
 	return needsOverwrite, nil
 }
 
-func writeToFile(cnf c.Config, path string) error {
+func writeToFile(cnf config.Config, path string) error {
 	for name, server := range cnf.Servers {
 		server = cleanForTOMLEncoding(server, cnf.Default)
 		cnf.Servers[name] = server
@@ -104,12 +103,17 @@ func writeToFile(cnf c.Config, path string) error {
 	if cnf.Default.WordPress != nil && cnf.Default.WordPress.IsZero() {
 		cnf.Default.WordPress = nil
 	}
+	if cnf.Default.PortScan != nil && cnf.Default.PortScan.IsZero() {
+		cnf.Default.PortScan = nil
+	}
 
 	c := struct {
-		Saas    *c.SaasConf             `toml:"saas"`
-		Default c.ServerInfo            `toml:"default"`
-		Servers map[string]c.ServerInfo `toml:"servers"`
+		Version string                       `toml:"version"`
+		Saas    *config.SaasConf             `toml:"saas"`
+		Default config.ServerInfo            `toml:"default"`
+		Servers map[string]config.ServerInfo `toml:"servers"`
 	}{
+		Version: "v2",
 		Saas:    &cnf.Saas,
 		Default: cnf.Default,
 		Servers: cnf.Servers,
@@ -134,15 +138,15 @@ func writeToFile(cnf c.Config, path string) error {
 	if err := toml.NewEncoder(&buf).Encode(c); err != nil {
 		return xerrors.Errorf("Failed to encode to toml: %w", err)
 	}
-	str := strings.Replace(buf.String(), "\n  [", "\n\n  [", -1)
+	str := strings.ReplaceAll(buf.String(), "\n  [", "\n\n  [")
 	str = fmt.Sprintf("%s\n\n%s",
-		"# See README for details: https://vuls.io/docs/en/usage-settings.html",
+		"# See README for details: https://vuls.io/docs/en/config.toml.html",
 		str)
 
-	return ioutil.WriteFile(realPath, []byte(str), 0600)
+	return os.WriteFile(realPath, []byte(str), 0600)
 }
 
-func cleanForTOMLEncoding(server c.ServerInfo, def c.ServerInfo) c.ServerInfo {
+func cleanForTOMLEncoding(server config.ServerInfo, def config.ServerInfo) config.ServerInfo {
 	if reflect.DeepEqual(server.Optional, def.Optional) {
 		server.Optional = nil
 	}
@@ -187,6 +191,10 @@ func cleanForTOMLEncoding(server c.ServerInfo, def c.ServerInfo) c.ServerInfo {
 		server.Enablerepo = nil
 	}
 
+	if reflect.DeepEqual(server.Disablerepo, def.Disablerepo) {
+		server.Disablerepo = nil
+	}
+
 	for k, v := range def.Optional {
 		if vv, ok := server.Optional[k]; ok && v == vv {
 			delete(server.Optional, k)
@@ -196,6 +204,12 @@ func cleanForTOMLEncoding(server c.ServerInfo, def c.ServerInfo) c.ServerInfo {
 	if server.WordPress != nil {
 		if server.WordPress.IsZero() || reflect.DeepEqual(server.WordPress, def.WordPress) {
 			server.WordPress = nil
+		}
+	}
+
+	if server.PortScan != nil {
+		if server.PortScan.IsZero() || reflect.DeepEqual(server.PortScan, def.PortScan) {
+			server.PortScan = nil
 		}
 	}
 

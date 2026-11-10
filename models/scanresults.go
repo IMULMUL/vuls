@@ -2,15 +2,17 @@ package models
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
 	"reflect"
-	"regexp"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/constant"
 	"github.com/future-architect/vuls/cwe"
-	"github.com/future-architect/vuls/util"
+	"github.com/future-architect/vuls/logging"
 )
 
 // ScanResults is a slide of ScanResult
@@ -18,104 +20,64 @@ type ScanResults []ScanResult
 
 // ScanResult has the result of scanned CVE information.
 type ScanResult struct {
-	JSONVersion      int                   `json:"jsonVersion"`
-	Lang             string                `json:"lang"`
-	ServerUUID       string                `json:"serverUUID"`
-	ServerName       string                `json:"serverName"` // TOML Section key
-	Family           string                `json:"family"`
-	Release          string                `json:"release"`
-	Container        Container             `json:"container"`
-	Platform         Platform              `json:"platform"`
-	IPv4Addrs        []string              `json:"ipv4Addrs,omitempty"` // only global unicast address (https://golang.org/pkg/net/#IP.IsGlobalUnicast)
-	IPv6Addrs        []string              `json:"ipv6Addrs,omitempty"` // only global unicast address (https://golang.org/pkg/net/#IP.IsGlobalUnicast)
-	IPSIdentifiers   map[config.IPS]string `json:"ipsIdentifiers,omitempty"`
-	ScannedAt        time.Time             `json:"scannedAt"`
-	ScanMode         string                `json:"scanMode"`
-	ScannedVersion   string                `json:"scannedVersion"`
-	ScannedRevision  string                `json:"scannedRevision"`
-	ScannedBy        string                `json:"scannedBy"`
-	ScannedVia       string                `json:"scannedVia"`
-	ScannedIPv4Addrs []string              `json:"scannedIpv4Addrs,omitempty"`
-	ScannedIPv6Addrs []string              `json:"scannedIpv6Addrs,omitempty"`
-	ReportedAt       time.Time             `json:"reportedAt"`
-	ReportedVersion  string                `json:"reportedVersion"`
-	ReportedRevision string                `json:"reportedRevision"`
-	ReportedBy       string                `json:"reportedBy"`
-	Errors           []string              `json:"errors"`
-	Warnings         []string              `json:"warnings"`
+	JSONVersion      int               `json:"jsonVersion"`
+	Lang             string            `json:"lang"`
+	ServerUUID       string            `json:"serverUUID"`
+	ServerName       string            `json:"serverName"` // TOML Section key
+	Family           string            `json:"family"`
+	Release          string            `json:"release"`
+	Container        Container         `json:"container"`
+	Platform         Platform          `json:"platform"`
+	IPv4Addrs        []string          `json:"ipv4Addrs,omitempty"` // only global unicast address (https://golang.org/pkg/net/#IP.IsGlobalUnicast)
+	IPv6Addrs        []string          `json:"ipv6Addrs,omitempty"` // only global unicast address (https://golang.org/pkg/net/#IP.IsGlobalUnicast)
+	IPSIdentifiers   map[string]string `json:"ipsIdentifiers,omitempty"`
+	ScannedAt        time.Time         `json:"scannedAt"`
+	ScanMode         string            `json:"scanMode"`
+	ScannedVersion   string            `json:"scannedVersion"`
+	ScannedRevision  string            `json:"scannedRevision"`
+	ScannedBy        string            `json:"scannedBy"`
+	ScannedVia       string            `json:"scannedVia"`
+	ScannedIPv4Addrs []string          `json:"scannedIpv4Addrs,omitempty"`
+	ScannedIPv6Addrs []string          `json:"scannedIpv6Addrs,omitempty"`
+	ReportedAt       time.Time         `json:"reportedAt"`
+	ReportedVersion  string            `json:"reportedVersion"`
+	ReportedRevision string            `json:"reportedRevision"`
+	ReportedBy       string            `json:"reportedBy"`
+	Errors           []string          `json:"errors"`
+	Warnings         []string          `json:"warnings"`
 
-	ScannedCves       VulnInfos              `json:"scannedCves"`
-	RunningKernel     Kernel                 `json:"runningKernel"`
-	Packages          Packages               `json:"packages"`
-	SrcPackages       SrcPackages            `json:",omitempty"`
-	EnabledDnfModules []string               `json:"enabledDnfModules,omitempty"` // for dnf modules
-	WordPressPackages WordPressPackages      `json:",omitempty"`
-	LibraryScanners   LibraryScanners        `json:"libraries,omitempty"`
-	CweDict           CweDict                `json:"cweDict,omitempty"`
-	Optional          map[string]interface{} `json:",omitempty"`
+	ScannedCves       VulnInfos                `json:"scannedCves"`
+	RunningKernel     Kernel                   `json:"runningKernel"`
+	Packages          Packages                 `json:"packages"`
+	SrcPackages       SrcPackages              `json:",omitempty"`
+	EnabledDnfModules []string                 `json:"enabledDnfModules,omitempty"` // for dnf modules
+	WordPressPackages WordPressPackages        `json:",omitempty"`
+	GitHubManifests   DependencyGraphManifests `json:"gitHubManifests,omitempty"`
+	LibraryScanners   LibraryScanners          `json:"libraries,omitempty"`
+	WindowsKB         *WindowsKB               `json:"windowsKB,omitempty"`
+	CWEDict           CWEDict                  `json:"cweDict,omitempty"`
+	CAPECDict         CAPECDict                `json:"capecDict,omitempty"`
+	ATTACKDict        ATTACKDict               `json:"attackDict,omitempty"`
+	Optional          map[string]any           `json:",omitempty"`
 	Config            struct {
 		Scan   config.Config `json:"scan"`
 		Report config.Config `json:"report"`
 	} `json:"config"`
 }
 
-// CweDict is a dictionary for CWE
-type CweDict map[string]CweDictEntry
-
-// Get the name, url, top10URL for the specified cweID, lang
-func (c CweDict) Get(cweID, lang string) (name, url, top10Rank, top10URL, cweTop25Rank, cweTop25URL, sansTop25Rank, sansTop25URL string) {
-	cweNum := strings.TrimPrefix(cweID, "CWE-")
-	switch config.Conf.Lang {
-	case "ja":
-		if dict, ok := c[cweNum]; ok && dict.OwaspTopTen2017 != "" {
-			top10Rank = dict.OwaspTopTen2017
-			top10URL = cwe.OwaspTopTen2017GitHubURLJa[dict.OwaspTopTen2017]
-		}
-		if dict, ok := c[cweNum]; ok && dict.CweTopTwentyfive2019 != "" {
-			cweTop25Rank = dict.CweTopTwentyfive2019
-			cweTop25URL = cwe.CweTopTwentyfive2019URL
-		}
-		if dict, ok := c[cweNum]; ok && dict.SansTopTwentyfive != "" {
-			sansTop25Rank = dict.SansTopTwentyfive
-			sansTop25URL = cwe.SansTopTwentyfiveURL
-		}
-		if dict, ok := cwe.CweDictJa[cweNum]; ok {
-			name = dict.Name
-			url = fmt.Sprintf("http://jvndb.jvn.jp/ja/cwe/%s.html", cweID)
-		} else {
-			if dict, ok := cwe.CweDictEn[cweNum]; ok {
-				name = dict.Name
-			}
-			url = fmt.Sprintf("https://cwe.mitre.org/data/definitions/%s.html", cweID)
-		}
-	default:
-		if dict, ok := c[cweNum]; ok && dict.OwaspTopTen2017 != "" {
-			top10Rank = dict.OwaspTopTen2017
-			top10URL = cwe.OwaspTopTen2017GitHubURLEn[dict.OwaspTopTen2017]
-		}
-		if dict, ok := c[cweNum]; ok && dict.CweTopTwentyfive2019 != "" {
-			cweTop25Rank = dict.CweTopTwentyfive2019
-			cweTop25URL = cwe.CweTopTwentyfive2019URL
-		}
-		if dict, ok := c[cweNum]; ok && dict.SansTopTwentyfive != "" {
-			sansTop25Rank = dict.SansTopTwentyfive
-			sansTop25URL = cwe.SansTopTwentyfiveURL
-		}
-		url = fmt.Sprintf("https://cwe.mitre.org/data/definitions/%s.html", cweID)
-		if dict, ok := cwe.CweDictEn[cweNum]; ok {
-			name = dict.Name
-		}
-	}
-	return
+// Container has Container information
+type Container struct {
+	ContainerID string `json:"containerID"`
+	Name        string `json:"name"`
+	Image       string `json:"image"`
+	Type        string `json:"type"`
+	UUID        string `json:"uuid"`
 }
 
-// CweDictEntry is a entry of CWE
-type CweDictEntry struct {
-	En                   *cwe.Cwe `json:"en,omitempty"`
-	Ja                   *cwe.Cwe `json:"ja,omitempty"`
-	OwaspTopTen2017      string   `json:"owaspTopTen2017"`
-	CweTopTwentyfive2019 string   `json:"cweTopTwentyfive2019"`
-	SansTopTwentyfive    string   `json:"sansTopTwentyfive"`
+// Platform has platform information
+type Platform struct {
+	Name       string `json:"name"` // aws or azure or gcp or other...
+	InstanceID string `json:"instanceID"`
 }
 
 // Kernel has the Release, version and whether need restart
@@ -125,131 +87,16 @@ type Kernel struct {
 	RebootRequired bool   `json:"rebootRequired"`
 }
 
-// FilterByCvssOver is filter function.
-func (r ScanResult) FilterByCvssOver(over float64) ScanResult {
-	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
-		if over <= v.MaxCvssScore().Value.Score {
-			return true
-		}
-		return false
-	})
-	r.ScannedCves = filtered
-	return r
-}
-
-// FilterIgnoreCves is filter function.
-func (r ScanResult) FilterIgnoreCves() ScanResult {
-	ignoreCves := []string{}
-	if len(r.Container.Name) == 0 {
-		//TODO pass by args
-		ignoreCves = config.Conf.Servers[r.ServerName].IgnoreCves
-	} else {
-		//TODO pass by args
-		if s, ok := config.Conf.Servers[r.ServerName]; ok {
-			if con, ok := s.Containers[r.Container.Name]; ok {
-				ignoreCves = con.IgnoreCves
-			} else {
-				return r
-			}
-		} else {
-			util.Log.Errorf("%s is not found in config.toml",
-				r.ServerName)
-			return r
-		}
-	}
-
-	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
-		for _, c := range ignoreCves {
-			if v.CveID == c {
-				return false
-			}
-		}
-		return true
-	})
-	r.ScannedCves = filtered
-	return r
-}
-
-// FilterUnfixed is filter function.
-func (r ScanResult) FilterUnfixed(ignoreUnfixed bool) ScanResult {
-	if !ignoreUnfixed {
-		return r
-	}
-	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
-		// Report cves detected by CPE because Vuls can't know 'fixed' or 'unfixed'
-		if len(v.CpeURIs) != 0 {
-			return true
-		}
-		NotFixedAll := true
-		for _, p := range v.AffectedPackages {
-			NotFixedAll = NotFixedAll && p.NotFixedYet
-		}
-		return !NotFixedAll
-	})
-	r.ScannedCves = filtered
-	return r
-}
-
-// FilterIgnorePkgs is filter function.
-func (r ScanResult) FilterIgnorePkgs() ScanResult {
-	var ignorePkgsRegexps []string
-	if len(r.Container.Name) == 0 {
-		//TODO pass by args
-		ignorePkgsRegexps = config.Conf.Servers[r.ServerName].IgnorePkgsRegexp
-	} else {
-		if s, ok := config.Conf.Servers[r.ServerName]; ok {
-			if con, ok := s.Containers[r.Container.Name]; ok {
-				ignorePkgsRegexps = con.IgnorePkgsRegexp
-			} else {
-				return r
-			}
-		} else {
-			util.Log.Errorf("%s is not found in config.toml",
-				r.ServerName)
-			return r
-		}
-	}
-
-	regexps := []*regexp.Regexp{}
-	for _, pkgRegexp := range ignorePkgsRegexps {
-		re, err := regexp.Compile(pkgRegexp)
-		if err != nil {
-			util.Log.Errorf("Failed to parse %s. err: %+v", pkgRegexp, err)
-			continue
-		} else {
-			regexps = append(regexps, re)
-		}
-	}
-	if len(regexps) == 0 {
-		return r
-	}
-
-	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
-		if len(v.AffectedPackages) == 0 {
-			return true
-		}
-		for _, p := range v.AffectedPackages {
-			match := false
-			for _, re := range regexps {
-				if re.MatchString(p.Name) {
-					match = true
-				}
-			}
-			if !match {
-				return true
-			}
-		}
-		return false
-	})
-
-	r.ScannedCves = filtered
-	return r
+// WindowsKB has applied and unapplied KBs
+type WindowsKB struct {
+	Applied   []string `json:"applied,omitempty"`
+	Unapplied []string `json:"unapplied,omitempty"`
 }
 
 // FilterInactiveWordPressLibs is filter function.
-func (r ScanResult) FilterInactiveWordPressLibs(detectInactive bool) ScanResult {
+func (r *ScanResult) FilterInactiveWordPressLibs(detectInactive bool) {
 	if detectInactive {
-		return r
+		return
 	}
 
 	filtered := r.ScannedCves.Find(func(v VulnInfo) bool {
@@ -262,18 +109,19 @@ func (r ScanResult) FilterInactiveWordPressLibs(detectInactive bool) ScanResult 
 				if p.Status != Inactive {
 					return true
 				}
+			} else {
+				logging.Log.Warnf("Failed to find the WordPress pkg: %+s", wp.Name)
 			}
 		}
 		return false
 	})
 	r.ScannedCves = filtered
-	return r
 }
 
 // ReportFileName returns the filename on localhost without extension
 func (r ScanResult) ReportFileName() (name string) {
-	if len(r.Container.ContainerID) == 0 {
-		return fmt.Sprintf("%s", r.ServerName)
+	if r.Container.ContainerID == "" {
+		return r.ServerName
 	}
 	return fmt.Sprintf("%s@%s", r.Container.Name, r.ServerName)
 }
@@ -281,7 +129,7 @@ func (r ScanResult) ReportFileName() (name string) {
 // ReportKeyName returns the name of key on S3, Azure-Blob without extension
 func (r ScanResult) ReportKeyName() (name string) {
 	timestr := r.ScannedAt.Format(time.RFC3339)
-	if len(r.Container.ContainerID) == 0 {
+	if r.Container.ContainerID == "" {
 		return fmt.Sprintf("%s/%s", timestr, r.ServerName)
 	}
 	return fmt.Sprintf("%s/%s@%s", timestr, r.Container.Name, r.ServerName)
@@ -289,7 +137,7 @@ func (r ScanResult) ReportKeyName() (name string) {
 
 // ServerInfo returns server name one line
 func (r ScanResult) ServerInfo() string {
-	if len(r.Container.ContainerID) == 0 {
+	if r.Container.ContainerID == "" {
 		return fmt.Sprintf("%s (%s%s)",
 			r.FormatServerName(), r.Family, r.Release)
 	}
@@ -304,7 +152,7 @@ func (r ScanResult) ServerInfo() string {
 
 // ServerInfoTui returns server information for TUI sidebar
 func (r ScanResult) ServerInfoTui() string {
-	if len(r.Container.ContainerID) == 0 {
+	if r.Container.ContainerID == "" {
 		line := fmt.Sprintf("%s (%s%s)",
 			r.ServerName, r.Family, r.Release)
 		if len(r.Warnings) != 0 {
@@ -325,7 +173,7 @@ func (r ScanResult) ServerInfoTui() string {
 
 // FormatServerName returns server and container name
 func (r ScanResult) FormatServerName() (name string) {
-	if len(r.Container.ContainerID) == 0 {
+	if r.Container.ContainerID == "" {
 		name = r.ServerName
 	} else {
 		name = fmt.Sprintf("%s@%s",
@@ -344,7 +192,7 @@ func (r ScanResult) FormatTextReportHeader() string {
 		buf.WriteString("=")
 	}
 
-	pkgs := r.FormatUpdatablePacksSummary()
+	pkgs := r.FormatUpdatablePkgsSummary()
 	if 0 < len(r.WordPressPackages) {
 		pkgs = fmt.Sprintf("%s, %d WordPress pkgs", pkgs, len(r.WordPressPackages))
 	}
@@ -352,20 +200,22 @@ func (r ScanResult) FormatTextReportHeader() string {
 		pkgs = fmt.Sprintf("%s, %d libs", pkgs, r.LibraryScanners.Total())
 	}
 
-	return fmt.Sprintf("%s\n%s\n%s\n%s, %s, %s, %s\n%s\n",
+	return fmt.Sprintf("%s\n%s\n%s\n%s, %s, %s, %s, %s\n%s\n",
 		r.ServerInfo(),
 		buf.String(),
 		r.ScannedCves.FormatCveSummary(),
 		r.ScannedCves.FormatFixedStatus(r.Packages),
 		r.FormatExploitCveSummary(),
 		r.FormatMetasploitCveSummary(),
+		r.FormatKEVCveSummary(),
 		r.FormatAlertSummary(),
 		pkgs)
 }
 
-// FormatUpdatablePacksSummary returns a summary of updatable packages
-func (r ScanResult) FormatUpdatablePacksSummary() string {
-	if !r.isDisplayUpdatableNum() {
+// FormatUpdatablePkgsSummary returns a summary of updatable packages
+func (r ScanResult) FormatUpdatablePkgsSummary() string {
+	mode := r.Config.Scan.Servers[r.ServerName].Mode
+	if !r.isDisplayUpdatableNum(mode) {
 		return fmt.Sprintf("%d installed", len(r.Packages))
 	}
 
@@ -405,30 +255,36 @@ func (r ScanResult) FormatMetasploitCveSummary() string {
 	return fmt.Sprintf("%d exploits", nMetasploitCve)
 }
 
-// FormatAlertSummary returns a summary of CERT alerts
-func (r ScanResult) FormatAlertSummary() string {
-	jaCnt := 0
-	enCnt := 0
+// FormatKEVCveSummary returns a summary of kev cve
+func (r ScanResult) FormatKEVCveSummary() string {
+	nKEVCve := 0
 	for _, vuln := range r.ScannedCves {
-		if len(vuln.AlertDict.En) > 0 {
-			enCnt += len(vuln.AlertDict.En)
-		}
-		if len(vuln.AlertDict.Ja) > 0 {
-			jaCnt += len(vuln.AlertDict.Ja)
+		if 0 < len(vuln.KEVs) {
+			nKEVCve++
 		}
 	}
-	return fmt.Sprintf("en: %d, ja: %d alerts", enCnt, jaCnt)
+	return fmt.Sprintf("%d kevs", nKEVCve)
 }
 
-func (r ScanResult) isDisplayUpdatableNum() bool {
-	if r.Family == config.FreeBSD {
+// FormatAlertSummary returns a summary of CERT alerts
+func (r ScanResult) FormatAlertSummary() string {
+	uscertCnt := 0
+	jpcertCnt := 0
+	for _, vuln := range r.ScannedCves {
+		if len(vuln.AlertDict.USCERT) > 0 {
+			uscertCnt += len(vuln.AlertDict.USCERT)
+		}
+		if len(vuln.AlertDict.JPCERT) > 0 {
+			jpcertCnt += len(vuln.AlertDict.JPCERT)
+		}
+	}
+	return fmt.Sprintf("uscert: %d, jpcert: %d alerts", uscertCnt, jpcertCnt)
+}
+
+func (r ScanResult) isDisplayUpdatableNum(mode config.ScanMode) bool {
+	if r.Family == constant.FreeBSD {
 		return false
 	}
-
-	var mode config.ScanMode
-	//TODO pass by args
-	s, _ := config.Conf.Servers[r.ServerName]
-	mode = s.Mode
 
 	if mode.IsOffline() {
 		return false
@@ -438,11 +294,11 @@ func (r ScanResult) isDisplayUpdatableNum() bool {
 	}
 	if mode.IsFast() {
 		switch r.Family {
-		case config.RedHat,
-			config.Oracle,
-			config.Debian,
-			config.Ubuntu,
-			config.Raspbian:
+		case constant.RedHat,
+			constant.Oracle,
+			constant.Debian,
+			constant.Ubuntu,
+			constant.Raspbian:
 			return false
 		default:
 			return true
@@ -456,58 +312,6 @@ func (r ScanResult) IsContainer() bool {
 	return 0 < len(r.Container.ContainerID)
 }
 
-// IsDeepScanMode checks if the scan mode is deep scan mode.
-func (r ScanResult) IsDeepScanMode() bool {
-	for _, s := range r.Config.Scan.Servers {
-		if ok := s.Mode.IsDeep(); ok {
-			return true
-		}
-	}
-	return false
-}
-
-// Container has Container information
-type Container struct {
-	ContainerID string `json:"containerID"`
-	Name        string `json:"name"`
-	Image       string `json:"image"`
-	Type        string `json:"type"`
-	UUID        string `json:"uuid"`
-}
-
-// Platform has platform information
-type Platform struct {
-	Name       string `json:"name"` // aws or azure or gcp or other...
-	InstanceID string `json:"instanceID"`
-}
-
-// RemoveRaspbianPackFromResult is for Raspberry Pi and removes the Raspberry Pi dedicated package from ScanResult.
-func (r ScanResult) RemoveRaspbianPackFromResult() ScanResult {
-	if r.Family != config.Raspbian {
-		return r
-	}
-
-	result := r
-	packs := make(Packages)
-	for _, pack := range r.Packages {
-		if !IsRaspbianPackage(pack.Name, pack.Version) {
-			packs[pack.Name] = pack
-		}
-	}
-	srcPacks := make(SrcPackages)
-	for _, pack := range r.SrcPackages {
-		if !IsRaspbianPackage(pack.Name, pack.Version) {
-			srcPacks[pack.Name] = pack
-
-		}
-	}
-
-	result.Packages = packs
-	result.SrcPackages = srcPacks
-
-	return result
-}
-
 // ClearFields clears a given fields of ScanResult
 func (r ScanResult) ClearFields(targetTagNames []string) ScanResult {
 	if len(targetTagNames) == 0 {
@@ -518,8 +322,7 @@ func (r ScanResult) ClearFields(targetTagNames []string) ScanResult {
 		target[strings.ToLower(n)] = true
 	}
 	t := reflect.ValueOf(r).Type()
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
+	for f := range t.Fields() {
 		jsonValue := strings.Split(f.Tag.Get("json"), ",")[0]
 		if ok := target[strings.ToLower(jsonValue)]; ok {
 			vv := reflect.New(f.Type).Elem().Interface()
@@ -527,4 +330,207 @@ func (r ScanResult) ClearFields(targetTagNames []string) ScanResult {
 		}
 	}
 	return r
+}
+
+// CheckEOL checks the EndOfLife of the OS
+func (r *ScanResult) CheckEOL() {
+	switch r.Family {
+	case constant.ServerTypePseudo, constant.Raspbian:
+		return
+	}
+
+	eol, found := config.GetEOL(r.Family, r.Release)
+	if !found {
+		r.Warnings = append(r.Warnings,
+			fmt.Sprintf("Failed to check EOL. Register the issue to https://github.com/future-architect/vuls/issues with the information in `Family: %s Release: %s`",
+				r.Family, r.Release))
+		return
+	}
+
+	now := time.Now()
+	if eol.IsStandardSupportEnded(now) {
+		r.Warnings = append(r.Warnings, "Standard OS support is EOL(End-of-Life). Purchase extended support if available or Upgrading your OS is strongly recommended.")
+		if eol.ExtendedSupportUntil.IsZero() {
+			return
+		}
+		if !eol.IsExtendedSuppportEnded(now) {
+			r.Warnings = append(r.Warnings,
+				fmt.Sprintf("Extended support available until %s. Check the vendor site.",
+					eol.ExtendedSupportUntil.Format("2006-01-02")))
+		} else {
+			r.Warnings = append(r.Warnings,
+				"Extended support is also EOL. There are many Vulnerabilities that are not detected, Upgrading your OS strongly recommended.")
+		}
+	} else if !eol.StandardSupportUntil.IsZero() &&
+		now.AddDate(0, 3, 0).After(eol.StandardSupportUntil) {
+		r.Warnings = append(r.Warnings,
+			fmt.Sprintf("Standard OS support will be end in 3 months. EOL date: %s",
+				eol.StandardSupportUntil.Format("2006-01-02")))
+	}
+}
+
+// SortForJSONOutput sort list elements in the ScanResult to diff in integration-test
+func (r *ScanResult) SortForJSONOutput() {
+	for k, v := range r.Packages {
+		slices.SortFunc(v.AffectedProcs, func(a, b AffectedProcess) int {
+			return cmp.Compare(a.PID, b.PID)
+		})
+		slices.SortFunc(v.NeedRestartProcs, func(a, b NeedRestartProcess) int {
+			return cmp.Compare(a.PID, b.PID)
+		})
+		r.Packages[k] = v
+	}
+	for i, v := range r.LibraryScanners {
+		slices.SortFunc(v.Libs, func(a, b Library) int {
+			return cmp.Or(
+				cmp.Compare(a.Name, b.Name),
+				cmp.Compare(a.Version, b.Version),
+			)
+		})
+		r.LibraryScanners[i] = v
+	}
+
+	for k, v := range r.ScannedCves {
+		slices.SortFunc(v.AffectedPackages, func(a, b PackageFixStatus) int {
+			return cmp.Compare(a.Name, b.Name)
+		})
+		slices.SortFunc(v.DistroAdvisories, func(a, b DistroAdvisory) int {
+			return cmp.Compare(a.AdvisoryID, b.AdvisoryID)
+		})
+		slices.SortFunc(v.Exploits, func(a, b Exploit) int {
+			return cmp.Compare(a.URL, b.URL)
+		})
+		slices.SortFunc(v.Metasploits, func(a, b Metasploit) int {
+			return cmp.Compare(a.Name, b.Name)
+		})
+		slices.SortFunc(v.Mitigations, func(a, b Mitigation) int {
+			return cmp.Compare(a.URL, b.URL)
+		})
+		slices.SortFunc(v.KEVs, func(a, b KEV) int {
+			return cmp.Or(
+				cmp.Compare(a.Type, b.Type),
+				cmp.Compare(a.VulnerabilityName, b.VulnerabilityName),
+			)
+		})
+
+		v.CveContents.Sort()
+
+		slices.SortFunc(v.AlertDict.USCERT, func(a, b Alert) int {
+			return cmp.Compare(a.Title, b.Title)
+		})
+		slices.SortFunc(v.AlertDict.JPCERT, func(a, b Alert) int {
+			return cmp.Compare(a.Title, b.Title)
+		})
+		slices.Sort(v.CTIs)
+		r.ScannedCves[k] = v
+	}
+
+	slices.Sort(r.Errors)
+	slices.Sort(r.Warnings)
+}
+
+// CWEDict is a dictionary for CWE
+type CWEDict map[string]CWEDictEntry
+
+// AttentionCWE has OWASP TOP10, CWE TOP25, CWE/SANS TOP25 rank and url
+type AttentionCWE struct {
+	Rank string
+	URL  string
+}
+
+// Get the name, url, top10URL for the specified cweID, lang. The returned URL
+// is always non-empty (mitre / JVN), so renderers building hyperlinks like
+// Slack's "<url|cweID>" can rely on it even when the dict has no entry for the
+// id — name / owasp / cwe25 / sans are empty in that case.
+func (c CWEDict) Get(cweID, lang string) (name, url string, owasp, cwe25, sans map[string]AttentionCWE) {
+	cweNum := strings.TrimPrefix(cweID, "CWE-")
+	dict := c[cweNum]
+
+	owasp, cwe25, sans = fillAttentionCwe(dict, lang)
+	switch lang {
+	case "ja":
+		if dict.Ja != nil && dict.Ja.Name != "" {
+			name = dict.Ja.Name
+			url = fmt.Sprintf("http://jvndb.jvn.jp/ja/cwe/%s.html", cweID)
+		} else {
+			if dict.En != nil {
+				name = dict.En.Name
+			}
+			url = fmt.Sprintf("https://cwe.mitre.org/data/definitions/%s.html", cweID)
+		}
+	default:
+		url = fmt.Sprintf("https://cwe.mitre.org/data/definitions/%s.html", cweID)
+		if dict.En != nil {
+			name = dict.En.Name
+		}
+	}
+	return
+}
+
+func fillAttentionCwe(dict CWEDictEntry, lang string) (owasp, cwe25, sans map[string]AttentionCWE) {
+	owasp, cwe25, sans = map[string]AttentionCWE{}, map[string]AttentionCWE{}, map[string]AttentionCWE{}
+	switch lang {
+	case "ja":
+		for year, rank := range dict.OwaspTopTens {
+			owasp[year] = AttentionCWE{
+				Rank: rank,
+				URL:  cwe.OwaspTopTenURLsJa[year][rank],
+			}
+		}
+	default:
+		for year, rank := range dict.OwaspTopTens {
+			owasp[year] = AttentionCWE{
+				Rank: rank,
+				URL:  cwe.OwaspTopTenURLsEn[year][rank],
+			}
+		}
+	}
+
+	for year, rank := range dict.CweTopTwentyfives {
+		cwe25[year] = AttentionCWE{
+			Rank: rank,
+			URL:  cwe.CweTopTwentyfiveURLs[year],
+		}
+	}
+
+	for year, rank := range dict.SansTopTwentyfives {
+		sans[year] = AttentionCWE{
+			Rank: rank,
+			URL:  cwe.SansTopTwentyfiveURLs[year],
+		}
+	}
+
+	return
+}
+
+// CWEDictEntry is a entry of CWE
+type CWEDictEntry struct {
+	En                 *cwe.CWE          `json:"en,omitempty"`
+	Ja                 *cwe.CWE          `json:"ja,omitempty"`
+	OwaspTopTens       map[string]string `json:"owaspTopTens"`
+	CweTopTwentyfives  map[string]string `json:"cweTopTwentyfives"`
+	SansTopTwentyfives map[string]string `json:"sansTopTwentyfives"`
+}
+
+// CAPECDict is a dictionary of MITRE CAPEC attack patterns keyed by CAPEC ID
+// (e.g. "CAPEC-66"), populated at enrich time so renderers can resolve
+// VulnInfo.CTIs entries to display metadata without a DB handle.
+type CAPECDict map[string]CAPECDictEntry
+
+// CAPECDictEntry is an entry of CAPECDict.
+type CAPECDictEntry struct {
+	CAPECID string `json:"capecID"`
+	Name    string `json:"name,omitempty"`
+}
+
+// ATTACKDict is a dictionary of MITRE ATT&CK techniques keyed by technique ID
+// (e.g. "T1552"), populated at enrich time so renderers can resolve
+// VulnInfo.CTIs entries to display metadata without a DB handle.
+type ATTACKDict map[string]ATTACKDictEntry
+
+// ATTACKDictEntry is an entry of ATTACKDict.
+type ATTACKDictEntry struct {
+	ATTACKID  string   `json:"attackID"`
+	Name      string   `json:"name,omitempty"`
+	Platforms []string `json:"platforms,omitempty"`
 }

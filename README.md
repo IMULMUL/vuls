@@ -1,16 +1,13 @@
 
 # Vuls: VULnerability Scanner
 
-[![Slack](https://img.shields.io/badge/slack-join-blue.svg)](http://goo.gl/forms/xm5KFo35tu)
 [![License](https://img.shields.io/github/license/future-architect/vuls.svg?style=flat-square)](https://github.com/future-architect/vuls/blob/master/LICENSE)
-[![Build Status](https://travis-ci.org/future-architect/vuls.svg?branch=master)](https://travis-ci.org/future-architect/vuls)
 [![Go Report Card](https://goreportcard.com/badge/github.com/future-architect/vuls)](https://goreportcard.com/report/github.com/future-architect/vuls)
 [![Contributors](https://img.shields.io/github/contributors/future-architect/vuls.svg)](https://github.com/future-architect/vuls/graphs/contributors)
 
 ![Vuls-logo](img/vuls_logo.png)
 
-Vulnerability scanner for Linux/FreeBSD, agent-less, written in Go.
-We have a slack team. [Join slack team](http://goo.gl/forms/xm5KFo35tu)
+Vulnerability scanner for Linux/FreeBSD, agent-less, written in Go.  
 Twitter: [@vuls_en](https://twitter.com/vuls_en)
 
 ![Vuls-Abstract](img/vuls-abstract.png)
@@ -46,12 +43,14 @@ Vuls is a tool created to solve the problems listed above. It has the following 
 
 ## Main Features
 
-### Scan for any vulnerabilities in Linux/FreeBSD Server
+### Scan for any vulnerabilities in Linux/FreeBSD/Windows/macOS
 
-[Supports major Linux/FreeBSD](https://vuls.io/docs/en/supported-os.html)
+[Supports major Linux/FreeBSD/Windows/macOS](https://vuls.io/docs/en/supported-os.html)
 
-- Alpine, Amazon Linux, CentOS, Debian, Oracle Linux, Raspbian, RHEL, SUSE Enterprise Linux, and Ubuntu
+- Alpine, Amazon Linux, CentOS, AlmaLinux, Rocky Linux, Debian, Oracle Linux, Raspbian, RHEL, openSUSE, openSUSE Leap, SUSE Enterprise Linux, Fedora, and Ubuntu
 - FreeBSD
+- Windows
+- macOS
 - Cloud, on-premise, Running Docker Container
 
 ### High-quality scan
@@ -63,7 +62,7 @@ Vuls is a tool created to solve the problems listed above. It has the following 
 - OVAL
   - [Red Hat](https://www.redhat.com/security/data/oval/)
   - [Debian](https://www.debian.org/security/oval/)
-  - [Ubuntu](https://people.canonical.com/~ubuntu-security/oval/)
+  - [Ubuntu](https://security-metadata.canonical.com/oval/)
   - [SUSE](http://ftp.suse.com/pub/projects/security/oval/)
   - [Oracle Linux](https://linux.oracle.com/security/oval/)
 
@@ -71,6 +70,8 @@ Vuls is a tool created to solve the problems listed above. It has the following 
   - [Alpine-secdb](https://git.alpinelinux.org/cgit/alpine-secdb/)
   - [Red Hat Security Advisories](https://access.redhat.com/security/security-updates/)
   - [Debian Security Bug Tracker](https://security-tracker.debian.org/tracker/)
+  - [Ubuntu CVE Tracker](https://people.canonical.com/~ubuntu-security/cve/)
+  - [Microsoft CVRF](https://api.msrc.microsoft.com/cvrf/v2.0/swagger/index)
 
 - Commands(yum, zypper, pkg-audit)
   - RHSA / ALAS / ELSA / FreeBSD-SA
@@ -79,17 +80,24 @@ Vuls is a tool created to solve the problems listed above. It has the following 
 - PoC, Exploit
   - [Exploit Database](https://www.exploit-db.com/)
   - [Metasploit-Framework modules](https://www.rapid7.com/db/?q=&type=metasploit)
+  - [qazbnm456/awesome-cve-poc](https://github.com/qazbnm456/awesome-cve-poc)
+  - [nomi-sec/PoC-in-GitHub](https://github.com/nomi-sec/PoC-in-GitHub)
+  - [gmatuz/inthewilddb](https://github.com/gmatuz/inthewilddb)
+  - [projectdiscovery/nuclei-templates](https://github.com/projectdiscovery/nuclei-templates)
 
 - CERT
   - [US-CERT](https://www.us-cert.gov/ncas/alerts)
   - [JPCERT](http://www.jpcert.or.jp/at/2019.html)
 
+- KEV
+  - CISA(Cybersecurity & Infrastructure Security Agency): [Known Exploited Vulnerabilities Catalog](https://www.cisa.gov/known-exploited-vulnerabilities-catalog)
+  - VulnCheck: [VulnCheck KEV](https://vulncheck.com/kev)
+
+- Cyber Threat Intelligence(MITRE ATT&CK and CAPEC)
+  - [mitre/cti](https://github.com/mitre/cti)
+
 - Libraries
-  - [Node.js Security Working Group](https://github.com/nodejs/security-wg)
-  - [Ruby Advisory Database](https://github.com/rubysec/ruby-advisory-db)
-  - [Safety DB(Python)](https://github.com/pyupio/safety-db)
-  - [PHP Security Advisories Database](https://github.com/FriendsOfPHP/security-advisories)
-  - [RustSec Advisory Database](https://github.com/RustSec/advisory-db)
+  - [aquasecurity/vuln-list](https://github.com/aquasecurity/vuln-list)
 
 - WordPress
   - [wpscan](https://wpscan.com/api)
@@ -100,15 +108,15 @@ Vuls is a tool created to solve the problems listed above. It has the following 
 
 - Scan without root privilege, no dependencies
 - Almost no load on the scan target server
-- Offline mode scan with no internet access. (CentOS, Debian, Oracle Linux, Red Hat, and Ubuntu)
+- Offline mode scan with no internet access. (CentOS, Alma Linux, Rocky Linux, Debian, Oracle Linux, Red Hat, Fedora, and Ubuntu)
 
 [Fast Root Scan](https://vuls.io/docs/en/architecture-fast-root-scan.html)
 
 - Scan with root privilege
 - Almost no load on the scan target server
-- Detect processes affected by update using yum-ps (Amazon Linux, CentOS, Oracle Linux, and RedHat)
+- Detect processes affected by update using yum-ps (Amazon Linux, CentOS, Alma Linux, Rocky Linux, Oracle Linux, Fedora, and RedHat)
 - Detect processes which updated before but not restarting yet using checkrestart of debian-goodies (Debian and Ubuntu)
-- Offline mode scan with no internet access. (CentOS, Debian, Oracle Linux, Red Hat, and Ubuntu)
+- Offline mode scan with no internet access. (CentOS, Alma Linux, Rocky Linux, Debian, Oracle Linux, Red Hat, Fedora, and Ubuntu)
 
 ### [Remote, Local scan mode, Server mode](https://vuls.io/docs/en/architecture-remote-local.html)
 
@@ -183,11 +191,14 @@ see [vulsdoc](https://vuls.io/docs/en/how-to-contribute.html)
 
 ----
 
-## Stargazers over time
+## Sponsors
 
-[![Stargazers over time](https://starcharts.herokuapp.com/future-architect/vuls.svg)](https://starcharts.herokuapp.com/future-architect/vuls)
+|  |  |
+| ------------- | ------------- |
+| <a href="https://www.tines.com/?utm_source=oss&utm_medium=sponsorship&utm_campaign=vuls"><img src="img/sponsor/tines.png" align="left" width="600px" ></a> | Tines is no-code automation for security teams. Build powerful, reliable workflows without a development team. |
+| <a href="https://www.sakura.ad.jp/"><img src="https://vuls.io/img/icons/sakura.svg" align="left" width="600px" ></a> | SAKURA internet Inc. is an Internet company founded in 1996. We provide cloud computing services such as "Sakura's Shared Server", "Sakura's VPS", and "Sakura's Cloud" to meet the needs of a wide range of customers, from individuals and corporations to the education and public sectors, using its own data centers in Japan. Based on the philosophy of "changing what you want to do into what you can do," we offer DX solutions for all fields.  |
 
------;
+----
 
 ## License
 

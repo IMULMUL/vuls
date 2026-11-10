@@ -1,0 +1,64 @@
+name: Diet PR Check
+on:
+  pull_request:
+    paths: ['go.mod', 'go.sum']
+
+permissions:
+  contents: read
+
+jobs:
+  diet-metrics:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Metrics (PR branch)
+        run: |
+          echo "AFTER_GOSUM=$(wc -l < go.sum)" >> "$GITHUB_ENV"
+          echo "AFTER_DEPS=$(grep -c '// indirect' go.mod | tr -d ' ' || echo 0)" >> "$GITHUB_ENV"
+          echo "AFTER_TOTAL=$(grep -cP $'^\t' go.mod || echo 0)" >> "$GITHUB_ENV"
+          CGO_ENABLED=0 go build -trimpath -o /tmp/vuls-after ./cmd/vuls
+          echo "AFTER_SIZE=$(stat -c%s /tmp/vuls-after)" >> "$GITHUB_ENV"
+          CGO_ENABLED=0 go build -tags=scanner -trimpath -o /tmp/scanner-after ./cmd/scanner
+          echo "AFTER_SCANNER_SIZE=$(stat -c%s /tmp/scanner-after)" >> "$GITHUB_ENV"
+
+      - name: Metrics (base branch)
+        run: |
+          git checkout "${{ github.event.pull_request.base.sha }}"
+          echo "BEFORE_GOSUM=$(wc -l < go.sum)" >> "$GITHUB_ENV"
+          echo "BEFORE_DEPS=$(grep -c '// indirect' go.mod | tr -d ' ' || echo 0)" >> "$GITHUB_ENV"
+          echo "BEFORE_TOTAL=$(grep -cP $'^\t' go.mod || echo 0)" >> "$GITHUB_ENV"
+          CGO_ENABLED=0 go build -trimpath -o /tmp/vuls-before ./cmd/vuls
+          echo "BEFORE_SIZE=$(stat -c%s /tmp/vuls-before)" >> "$GITHUB_ENV"
+          CGO_ENABLED=0 go build -tags=scanner -trimpath -o /tmp/scanner-before ./cmd/scanner
+          echo "BEFORE_SCANNER_SIZE=$(stat -c%s /tmp/scanner-before)" >> "$GITHUB_ENV"
+
+      - name: Report
+        run: |
+          before_direct=$((BEFORE_TOTAL - BEFORE_DEPS))
+          after_direct=$((AFTER_TOTAL - AFTER_DEPS))
+          delta_gosum=$((AFTER_GOSUM - BEFORE_GOSUM))
+          delta_direct=$((after_direct - before_direct))
+          delta_indirect=$((AFTER_DEPS - BEFORE_DEPS))
+          delta_kb=$(( (AFTER_SIZE - BEFORE_SIZE) / 1024 ))
+          delta_scanner_kb=$(( (AFTER_SCANNER_SIZE - BEFORE_SCANNER_SIZE) / 1024 ))
+          before_mb=$(awk "BEGIN{printf \"%.1f\", $BEFORE_SIZE/1048576}")
+          after_mb=$(awk "BEGIN{printf \"%.1f\", $AFTER_SIZE/1048576}")
+          before_scanner_mb=$(awk "BEGIN{printf \"%.1f\", $BEFORE_SCANNER_SIZE/1048576}")
+          after_scanner_mb=$(awk "BEGIN{printf \"%.1f\", $AFTER_SCANNER_SIZE/1048576}")
+          {
+            echo "## Diet Metrics"
+            echo "| Metric | Before | After | Delta |"
+            echo "|--------|--------|-------|-------|"
+            echo "| go.sum lines | $BEFORE_GOSUM | $AFTER_GOSUM | ${delta_gosum} |"
+            echo "| Direct deps | ${before_direct} | ${after_direct} | ${delta_direct} |"
+            echo "| Indirect deps | $BEFORE_DEPS | $AFTER_DEPS | ${delta_indirect} |"
+            echo "| Binary size (full) | ${before_mb}MB | ${after_mb}MB | ${delta_kb}KB |"
+            echo "| Binary size (scanner) | ${before_scanner_mb}MB | ${after_scanner_mb}MB | ${delta_scanner_kb}KB |"
+          } >> "$GITHUB_STEP_SUMMARY"

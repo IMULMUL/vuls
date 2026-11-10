@@ -3,10 +3,15 @@ package models
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 
 	"golang.org/x/xerrors"
+
+	"github.com/future-architect/vuls/constant"
 )
 
 // Packages is Map of Package
@@ -43,12 +48,8 @@ func (ps Packages) MergeNewVersion(as Packages) {
 // Merge returns merged map (immutable)
 func (ps Packages) Merge(other Packages) Packages {
 	merged := Packages{}
-	for k, v := range ps {
-		merged[k] = v
-	}
-	for k, v := range other {
-		merged[k] = v
-	}
+	maps.Copy(merged, ps)
+	maps.Copy(merged, other)
 	return merged
 }
 
@@ -81,9 +82,19 @@ type Package struct {
 	NewRelease       string               `json:"newRelease"`
 	Arch             string               `json:"arch"`
 	Repository       string               `json:"repository"`
+	Vendor           string               `json:"vendor,omitempty"`
+	ModularityLabel  string               `json:"modularitylabel"`
 	Changelog        *Changelog           `json:"changelog,omitempty"`
 	AffectedProcs    []AffectedProcess    `json:",omitempty"`
 	NeedRestartProcs []NeedRestartProcess `json:",omitempty"`
+
+	// RepositoryClass is how the scanner classified the distribution channel of
+	// the package: "", "official" or "third-party". It is unrelated to the
+	// Repository field above, which holds the apt/yum repository name.
+	// Only Trivy sets it, passed through from its Package.Repository.Class;
+	// "third-party" there means Trivy skipped OS advisory matching for the
+	// package, so the absence of CVEs is not evidence that it is unaffected.
+	RepositoryClass string `json:"repositoryClass,omitempty"`
 }
 
 // FQPN returns Fully-Qualified-Package-Name
@@ -139,7 +150,6 @@ func (p Package) FormatVersionFromTo(stat PackageFixStatus) string {
 
 // FormatChangelog formats the changelog
 func (p Package) FormatChangelog() string {
-	buf := []string{}
 	packVer := fmt.Sprintf("%s-%s -> %s",
 		p.Name, p.FormatVer(), p.FormatNewVer())
 	var delim bytes.Buffer
@@ -158,8 +168,7 @@ func (p Package) FormatChangelog() string {
 	case FailedToFindVersionInChangelog:
 		clog = "Failed to parse changelogs. For details, check yourself"
 	}
-	buf = append(buf, packVer, delim.String(), clog)
-	return strings.Join(buf, "\n")
+	return strings.Join([]string{packVer, delim.String(), clog}, "\n")
 }
 
 // Changelog has contents of changelog and how to get it.
@@ -234,15 +243,10 @@ type SrcPackage struct {
 
 // AddBinaryName add the name if not exists
 func (s *SrcPackage) AddBinaryName(name string) {
-	found := false
-	for _, n := range s.BinaryNames {
-		if n == name {
-			return
-		}
+	if slices.Contains(s.BinaryNames, name) {
+		return
 	}
-	if !found {
-		s.BinaryNames = append(s.BinaryNames, name)
-	}
+	s.BinaryNames = append(s.BinaryNames, name)
 }
 
 // SrcPackages is Map of SrcPackage
@@ -252,10 +256,8 @@ type SrcPackages map[string]SrcPackage
 // FindByBinName finds by bin-package-name
 func (s SrcPackages) FindByBinName(name string) (*SrcPackage, bool) {
 	for _, p := range s {
-		for _, binName := range p.BinaryNames {
-			if binName == name {
-				return &p, true
-			}
+		if slices.Contains(p.BinaryNames, name) {
+			return &p, true
 		}
 	}
 	return nil, false
@@ -277,11 +279,184 @@ func IsRaspbianPackage(name, version string) bool {
 	if raspiPackNamePattern.MatchString(name) || raspiPackVersionPattern.MatchString(version) {
 		return true
 	}
-	for _, n := range raspiPackNameList {
-		if n == name {
-			return true
-		}
-	}
+	return slices.Contains(raspiPackNameList, name)
+}
 
-	return false
+// RenameKernelSourcePackageName is change common kernel source package
+func RenameKernelSourcePackageName(family, name string) string {
+	switch family {
+	case constant.Debian, constant.Raspbian:
+		if !strings.HasPrefix(name, "linux-") {
+			return name
+		}
+
+		return strings.NewReplacer("linux-signed", "linux", "linux-latest", "linux", "-amd64", "", "-arm64", "", "-i386", "").Replace(name)
+	case constant.Ubuntu:
+		if !strings.HasPrefix(name, "linux-") {
+			return name
+		}
+
+		return strings.NewReplacer("linux-signed", "linux", "linux-meta", "linux").Replace(name)
+	default:
+		return name
+	}
+}
+
+// IsKernelSourcePackage check whether the source package is a kernel package
+func IsKernelSourcePackage(family, name string) bool {
+	switch family {
+	case constant.Debian, constant.Raspbian:
+		switch ss := strings.Split(RenameKernelSourcePackageName(family, name), "-"); len(ss) {
+		case 1:
+			return ss[0] == "linux"
+		case 2:
+			if ss[0] != "linux" {
+				return false
+			}
+			switch ss[1] {
+			case "grsec":
+				return true
+			default:
+				_, err := strconv.ParseFloat(ss[1], 64)
+				return err == nil
+			}
+		default:
+			return false
+		}
+	case constant.Ubuntu: // https://git.launchpad.net/ubuntu-cve-tracker/tree/scripts/cve_lib.py#n1219
+		switch ss := strings.Split(RenameKernelSourcePackageName(family, name), "-"); len(ss) {
+		case 1:
+			return ss[0] == "linux"
+		case 2:
+			if ss[0] != "linux" {
+				return false
+			}
+			switch ss[1] {
+			case "armadaxp", "mako", "manta", "flo", "goldfish", "joule", "raspi", "raspi2", "snapdragon", "allwinner", "aws", "azure", "bluefield", "dell300x", "gcp", "gke", "gkeop", "ibm", "iot", "laptop", "lowlatency", "kvm", "nvidia", "oem", "oracle", "euclid", "hwe", "riscv", "starfive", "realtime", "mtk":
+				return true
+			default:
+				_, err := strconv.ParseFloat(ss[1], 64)
+				return err == nil
+			}
+		case 3:
+			if ss[0] != "linux" {
+				return false
+			}
+			switch ss[1] {
+			case "ti":
+				return ss[2] == "omap4"
+			case "raspi", "raspi2", "allwinner", "gke", "gkeop", "ibm", "oracle", "riscv", "starfive":
+				_, err := strconv.ParseFloat(ss[2], 64)
+				return err == nil
+			case "aws":
+				switch ss[2] {
+				case "hwe", "edge":
+					return true
+				default:
+					_, err := strconv.ParseFloat(ss[2], 64)
+					return err == nil
+				}
+			case "azure":
+				switch ss[2] {
+				case "cvm", "fde", "edge":
+					return true
+				default:
+					_, err := strconv.ParseFloat(ss[2], 64)
+					return err == nil
+				}
+			case "gcp":
+				switch ss[2] {
+				case "edge":
+					return true
+				default:
+					_, err := strconv.ParseFloat(ss[2], 64)
+					return err == nil
+				}
+			case "intel":
+				switch ss[2] {
+				case "iotg", "opt":
+					return true
+				default:
+					_, err := strconv.ParseFloat(ss[2], 64)
+					return err == nil
+				}
+			case "oem":
+				switch ss[2] {
+				case "osp1":
+					return true
+				default:
+					_, err := strconv.ParseFloat(ss[2], 64)
+					return err == nil
+				}
+			case "lts":
+				switch ss[2] {
+				case "utopic", "vivid", "wily", "xenial":
+					return true
+				default:
+					return false
+				}
+			case "hwe":
+				switch ss[2] {
+				case "edge":
+					return true
+				default:
+					_, err := strconv.ParseFloat(ss[2], 64)
+					return err == nil
+				}
+			case "xilinx":
+				return ss[2] == "zynqmp"
+			case "nvidia":
+				switch ss[2] {
+				case "tegra":
+					return true
+				default:
+					_, err := strconv.ParseFloat(ss[2], 64)
+					return err == nil
+				}
+			default:
+				return false
+			}
+		case 4:
+			if ss[0] != "linux" {
+				return false
+			}
+			switch ss[1] {
+			case "azure":
+				if ss[2] != "fde" {
+					return false
+				}
+				_, err := strconv.ParseFloat(ss[3], 64)
+				return err == nil
+			case "intel":
+				if ss[2] != "iotg" {
+					return false
+				}
+				_, err := strconv.ParseFloat(ss[3], 64)
+				return err == nil
+			case "lowlatency":
+				if ss[2] != "hwe" {
+					return false
+				}
+				_, err := strconv.ParseFloat(ss[3], 64)
+				return err == nil
+			case "nvidia":
+				if ss[2] != "tegra" {
+					return false
+				}
+				switch ss[3] {
+				case "igx":
+					return true
+				default:
+					_, err := strconv.ParseFloat(ss[3], 64)
+					return err == nil
+				}
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	default:
+		return false
+	}
 }

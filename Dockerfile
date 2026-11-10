@@ -1,4 +1,4 @@
-FROM golang:alpine as builder
+FROM golang:alpine@sha256:b8c9b82affbbb82a020bbcf998dad2ba9516944ac7e883524642a481a9505e9c as builder
 
 RUN apk add --no-cache \
         git \
@@ -10,10 +10,7 @@ ENV REPOSITORY github.com/future-architect/vuls
 COPY . $GOPATH/src/$REPOSITORY
 RUN cd $GOPATH/src/$REPOSITORY && make install
 
-
-FROM alpine:3.11
-
-MAINTAINER hikachan sadayuki-matsuno
+FROM alpine:3.24@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b
 
 ENV LOGDIR /var/log/vuls
 ENV WORKDIR /vuls
@@ -22,6 +19,7 @@ RUN apk add --no-cache \
         openssh-client \
         ca-certificates \
         git \
+        nmap \
     && mkdir -p $WORKDIR $LOGDIR
 
 COPY --from=builder /go/bin/vuls /usr/local/bin/

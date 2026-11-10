@@ -5,13 +5,15 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"text/template"
 
 	"github.com/google/subcommands"
-
 	ps "github.com/kotakanbe/go-pingscanner"
-	"github.com/sirupsen/logrus"
+
+	"github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/logging"
 )
 
 // DiscoverCmd is Subcommand of host discovery mode
@@ -33,37 +35,44 @@ func (*DiscoverCmd) Usage() string {
 }
 
 // SetFlags set flag
-func (p *DiscoverCmd) SetFlags(f *flag.FlagSet) {
+func (p *DiscoverCmd) SetFlags(_ *flag.FlagSet) {
 }
 
 // Execute execute
-func (p *DiscoverCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...interface{}) subcommands.ExitStatus {
+func (p *DiscoverCmd) Execute(_ context.Context, f *flag.FlagSet, _ ...any) subcommands.ExitStatus {
+	logging.Log = logging.NewCustomLogger(false, false, false, config.Conf.LogDir, "", "")
+	logging.Log.Infof("vuls-%s-%s", config.Version, config.Revision)
 	// validate
 	if len(f.Args()) == 0 {
-		logrus.Errorf("Usage: " + p.Usage())
+		logging.Log.Errorf("Usage: %s", p.Usage())
 		return subcommands.ExitUsageError
 	}
 
 	for _, cidr := range f.Args() {
 		scanner := ps.PingScanner{
 			CIDR: cidr,
-			PingOptions: []string{
-				"-c1",
-			},
+			PingOptions: func() []string {
+				switch runtime.GOOS {
+				case "windows":
+					return []string{"-n", "1"}
+				default:
+					return []string{"-c", "1"}
+				}
+			}(),
 			NumOfConcurrency: 100,
 		}
 		hosts, err := scanner.Scan()
 
 		if err != nil {
-			logrus.Errorf("Host Discovery failed. err: %s", err)
+			logging.Log.Errorf("Host Discovery failed. err: %+v", err)
 			return subcommands.ExitFailure
 		}
 
 		if len(hosts) < 1 {
-			logrus.Errorf("Active hosts not found in %s", cidr)
+			logging.Log.Errorf("Active hosts not found in %s", cidr)
 			return subcommands.ExitSuccess
 		} else if err := printConfigToml(hosts); err != nil {
-			logrus.Errorf("Failed to parse template. err: %s", err)
+			logging.Log.Errorf("Failed to parse template. err: %+v", err)
 			return subcommands.ExitFailure
 		}
 	}
@@ -79,26 +88,14 @@ func printConfigToml(ips []string) (err error) {
 #type = ["sqlite3", "mysql", "postgres", "redis", "http" ]
 #sqlite3Path = "/path/to/cve.sqlite3"
 #url        = ""
+#debugSQL = false
+#timeoutSec = 0
+#timeoutSecPerRequest = 0
 
-[ovalDict]
-#type = ["sqlite3", "mysql", "postgres", "redis", "http" ]
-#sqlite3Path = "/path/to/oval.sqlite3"
-#url        = ""
-
-[gost]
-#type = ["sqlite3", "mysql", "postgres", "redis", "http" ]
-#sqlite3Path = "/path/to/gost.sqlite3"
-#url        = ""
-
-[exploit]
-#type = ["sqlite3", "mysql", "postgres", "redis", "http" ]
-#sqlite3Path = "/path/to/go-exploitdb.sqlite3"
-#url        = ""
-
-[metasploit]
-#type = ["sqlite3", "mysql", "postgres", "redis", "http" ]
-#sqlite3Path = "/path/to/go-msfdb.sqlite3"
-#url        = ""
+[vuls2]
+#Path = "/path/to/vuls.db"
+#Repository = "ghcr.io/vulsio/vuls-nightly-db:<schema-version>"
+#SkipUpdate = false
 
 # https://vuls.io/docs/en/config.toml.html#slack-section
 #[slack]
@@ -112,14 +109,16 @@ func printConfigToml(ips []string) (err error) {
 
 # https://vuls.io/docs/en/config.toml.html#email-section
 #[email]
-#smtpAddr      = "smtp.example.com"
-#smtpPort      = "587"
-#user          = "username"
-#password      = "password"
-#from          = "from@example.com"
-#to            = ["to@example.com"]
-#cc            = ["cc@example.com"]
-#subjectPrefix = "[vuls]"
+#smtpAddr              = "smtp.example.com"
+#smtpPort              = "587"
+#tlsMode               = "STARTTLS"
+#tlsInsecureSkipVerify = false
+#user                  = "username"
+#password              = "password"
+#from                  = "from@example.com"
+#to                    = ["to@example.com"]
+#cc                    = ["cc@example.com"]
+#subjectPrefix         = "[vuls]"
 
 # https://vuls.io/docs/en/config.toml.html#http-section
 #[http]
@@ -137,14 +136,18 @@ func printConfigToml(ips []string) (err error) {
 
 # https://vuls.io/docs/en/usage-report.html#example-put-results-in-s3-bucket
 #[aws]
-#profile                = "default"
+#s3Endpoint             = "http://localhost:9000"
 #region                 = "ap-northeast-1"
+#profile                = "default"
+#credentialProvider     = "anonymous"
 #s3Bucket               = "vuls"
 #s3ResultsDir           = "/path/to/result"
 #s3ServerSideEncryption = "AES256"
+#s3UsePathStyle         = false
 
-# https://vuls.io/docs/en/usage-report.html#example-put-results-in-azure-blob-storage<Paste>
+# https://vuls.io/docs/en/usage-report.html#example-put-results-in-azure-blob-storage
 #[azure]
+#endpoint      = "https://default.blob.core.windows.net/"
 #accountName   = "default"
 #accountKey    = "xxxxxxxxxxxxxx"
 #containerName = "vuls"
@@ -153,6 +156,13 @@ func printConfigToml(ips []string) (err error) {
 #[chatwork]
 #room     = "xxxxxxxxxxx"
 #apiToken = "xxxxxxxxxxxxxxxxxx"
+
+# https://vuls.io/docs/en/config.toml.html#googlechat-section
+#[googlechat]
+#webHookURL = "https://chat.googleapis.com/v1/spaces/xxxxxxxxxx/messages?key=yyyyyyyyyy&token=zzzzzzzzzz%3D"
+#skipIfNoCve = false
+#serverNameRegexp = "^(\\[Reboot Required\\] )?((spam|ham).*|.*(egg)$)" # include spamonigiri, hamburger, boiledegg
+#serverNameRegexp = "^(\\[Reboot Required\\] )?(?:(spam|ham).*|.*(?:egg)$)" # exclude spamonigiri, hamburger, boiledegg
 
 # https://vuls.io/docs/en/config.toml.html#telegram-section
 #[telegram]
@@ -170,15 +180,17 @@ func printConfigToml(ips []string) (err error) {
 #keyPath            = "/home/username/.ssh/id_rsa"
 #scanMode           = ["fast", "fast-root", "deep", "offline"]
 #scanModules        = ["ospkg", "wordpress", "lockfile", "port"]
+#lockfiles = ["/path/to/package-lock.json"]
 #cpeNames = [
 #  "cpe:/a:rubyonrails:ruby_on_rails:4.2.1",
 #]
 #owaspDCXMLPath     = "/tmp/dependency-check-report.xml"
 #ignoreCves         = ["CVE-2014-6271"]
-#containersOnly     = false
 #containerType      = "docker" #or "lxd" or "lxc" default: docker
 #containersIncluded = ["${running}"]
 #containersExcluded = ["container_name_a"]
+#enablerepo         = ["base", "updates"] # For RHEL-family. Currently only "base" and "updates" are allowed
+#disablerepo        = ["epel"] # For RHEL-family
 
 # https://vuls.io/docs/en/config.toml.html#servers-section
 [servers]
@@ -186,6 +198,7 @@ func printConfigToml(ips []string) (err error) {
 {{range $i, $ip := .IPs}}
 [servers.{{index $names $i}}]
 host                = "{{$ip}}"
+#ignoreIPAddresses  = ["{{$ip}}"]
 #port               = "22"
 #user               = "root"
 #sshConfigPath		= "/home/username/.ssh/config"
@@ -194,6 +207,9 @@ host                = "{{$ip}}"
 #scanModules        = ["ospkg", "wordpress", "lockfile", "port"]
 #type               = "pseudo"
 #memo               = "DB Server"
+#findLock = true
+#findLockDirs = [ "/path/to/prject/lib" ]
+#lockfiles = ["/path/to/package-lock.json"]
 #cpeNames           = [ "cpe:/a:rubyonrails:ruby_on_rails:4.2.1" ]
 #owaspDCXMLPath     = "/path/to/dependency-check-report.xml"
 #ignoreCves         = ["CVE-2014-0160"]
@@ -201,19 +217,30 @@ host                = "{{$ip}}"
 #containerType      = "docker" #or "lxd" or "lxc" default: docker
 #containersIncluded = ["${running}"]
 #containersExcluded = ["container_name_a"]
+#enablerepo         = ["base", "updates"] # For RHEL-family. Currently only "base" and "updates" are allowed
+#disablerepo        = ["epel"] # For RHEL-family
+#confidenceScoreOver = 80
 
 #[servers.{{index $names $i}}.containers.container_name_a]
 #cpeNames       = [ "cpe:/a:rubyonrails:ruby_on_rails:4.2.1" ]
 #owaspDCXMLPath = "/path/to/dependency-check-report.xml"
 #ignoreCves     = ["CVE-2014-0160"]
 
-#[servers.{{index $names $i}}.githubs."owner/repo"]
-#token   = "yourToken"
-
 #[servers.{{index $names $i}}.wordpress]
 #cmdPath = "/usr/local/bin/wp"
 #osUser = "wordpress"
 #docRoot = "/path/to/DocumentRoot/"
+#noSudo = false
+
+#[servers.{{index $names $i}}.portscan]
+#scannerBinPath = "/usr/bin/nmap"
+#hasPrivileged = true
+#scanTechniques = ["sS"]
+#sourcePort = "65535"
+
+#[servers.{{index $names $i}}.windows]
+#serverSelection = 3
+#cabPath = "/path/to/wsusscn2.cab"
 
 #[servers.{{index $names $i}}.optional]
 #key = "value1"
@@ -235,7 +262,7 @@ host                = "{{$ip}}"
 	names := []string{}
 	for _, ip := range ips {
 		// TOML section header must not contain "."
-		name := strings.Replace(ip, ".", "-", -1)
+		name := strings.ReplaceAll(ip, ".", "-")
 		names = append(names, name)
 	}
 	a.Names = names

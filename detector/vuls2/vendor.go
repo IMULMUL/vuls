@@ -1,0 +1,2165 @@
+package vuls2
+
+import (
+	"cmp"
+	"fmt"
+	"maps"
+	"slices"
+	"strings"
+	"time"
+
+	apk "github.com/knqyf263/go-apk-version"
+	deb "github.com/knqyf263/go-deb-version"
+	rpm "github.com/knqyf263/go-rpm-version"
+	"golang.org/x/xerrors"
+
+	dataTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data"
+	advisoryTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/advisory"
+	cweTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/cwe"
+	criterionTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion"
+	noneexistcriterionTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion/noneexistcriterion"
+	vcAffectedRangeTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion/versioncriterion/affected/range"
+	fixstatusTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion/versioncriterion/fixstatus"
+	versioncriterionpackageTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/condition/criteria/criterion/versioncriterion/package"
+	segmentTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/segment"
+	ecosystemTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/detection/segment/ecosystem"
+	severityTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity"
+	v2 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v2"
+	v31 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v31"
+	v40 "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/severity/cvss/v40"
+	ssvcTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/ssvc"
+	vulnerabilityTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/data/vulnerability"
+	sourceTypes "github.com/MaineK00n/vuls-data-update/pkg/extract/types/source"
+	dbTypes "github.com/MaineK00n/vuls2/pkg/db/session/types"
+	scanTypes "github.com/MaineK00n/vuls2/pkg/scan/types"
+
+	"github.com/future-architect/vuls/constant"
+	"github.com/future-architect/vuls/models"
+)
+
+func preConvertBinaryVersion(family, version string) string {
+	switch family {
+	case constant.Debian, constant.Raspbian, constant.Ubuntu:
+		// https://github.com/future-architect/vuls/pull/2329
+		// If you are using a scanner from before this PR was merged, the binary package version will be lost when updating NeedRestartProcs during a fast-root scan.
+		// However, the current data source does not require the binary package version, so it will be filled in with "0".
+		if version == "" {
+			return "0"
+		}
+		return version
+	default:
+		return version
+	}
+}
+
+func toVuls2Family(vuls0Family, vuls0Release string) string {
+	switch vuls0Family {
+	case constant.Windows:
+		return ecosystemTypes.EcosystemTypeMicrosoft
+	case constant.Raspbian:
+		return ecosystemTypes.EcosystemTypeDebian
+	case constant.SUSEEnterpriseServer, constant.SUSEEnterpriseDesktop:
+		return ecosystemTypes.EcosystemTypeSUSELinuxEnterprise
+	case constant.OpenSUSE:
+		switch vuls0Release {
+		case "tumbleweed":
+			return ecosystemTypes.EcosystemTypeOpenSUSETumbleweed
+		default:
+			return vuls0Family
+		}
+	default:
+		return vuls0Family
+	}
+}
+
+func toVuls2Release(vuls0Family, vuls0Release string) string {
+	switch vuls0Family {
+	case constant.Amazon:
+		// Normalize to the Amazon Linux major version ("1", "2", "2022", "2023", ...).
+		// Older vuls scanners stored releases with a codename suffix (e.g. "2 (Karoo)",
+		// "2022 (Amazon Linux)") and Amazon Linux 1 was stored as its date-style version
+		// (e.g. "2017.09", "2018.03"). The new scanner can also produce patch-suffixed
+		// values like "2023.3.20240312". Reducing all of these to the major version here
+		// keeps scanTypes.ScanResult.Release canonical and avoids surprises like
+		// "amazon:2 (Karoo)" or "amazon:2018" appearing in the downstream ecosystem.
+		fields := strings.Fields(vuls0Release)
+		if len(fields) == 0 {
+			return vuls0Release
+		}
+		s := fields[0]
+		if _, err := time.Parse("2006.01", s); err == nil {
+			return "1"
+		}
+		return strings.Split(s, ".")[0]
+	case constant.OpenSUSE:
+		switch vuls0Release {
+		case "tumbleweed":
+			return ""
+		default:
+			return vuls0Release
+		}
+	default:
+		return vuls0Release
+	}
+}
+
+func ignoreVulnerability(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID, v vulnerabilityTypes.Vulnerability, as models.DistroAdvisories) bool {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeCPE:
+		switch s {
+		case sourceTypes.NVDAPICVE, sourceTypes.NVDFeedCVEv1, sourceTypes.NVDFeedCVEv2, sourceTypes.VulnCheckNISTNVD2:
+			// NVD / VulnCheck (CVE-keyed CPE sources) publish the rejection in
+			// the vulnerability description itself ("** REJECT **",
+			// "[REJECTED CVE]", "Rejected reason:").
+			if strings.HasPrefix(v.Content.Description, "** REJECT **") ||
+				strings.HasPrefix(v.Content.Description, "[REJECTED CVE]") ||
+				strings.HasPrefix(v.Content.Description, "Rejected reason:") {
+				return true
+			}
+			return false
+		case sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+			// JVN invalidates a JVNDB entry in place with a description marker
+			// ("** 削除 **" withdrawn, "** 未確定 **" unconfirmed,
+			// "** サポート外 **" unsupported); go-cve-dictionary drops all three
+			// at fetch. The JVN vulnerability content carries only the CVE id,
+			// so the marker is read from the advisory descriptions (the only
+			// field carried on models.DistroAdvisory).
+			//
+			// There is deliberately no len(as)==0 guard as in the RedHat/Ubuntu
+			// branches. Those keep the vulnerability when no advisory is present
+			// because their vulnerability content carries its own (NVD-sourced)
+			// description that was already checked for a reject marker. A JVN CPE
+			// vulnerability has no such description: the JVNDB advisory is the
+			// sole detection basis and shares this source's segment, so as is
+			// always non-empty here. Were it ever empty, filterDistroAdvisories
+			// returns empty and the CVE is dropped — acceptable, since a JVN
+			// detection with no backing advisory is malformed. Drop the
+			// vulnerability when every backing advisory is marked.
+			return len(filterDistroAdvisories(e, s, as)) == 0
+		default:
+			return false
+		}
+	case ecosystemTypes.EcosystemTypeRedHat:
+		if strings.Contains(v.Content.Description, "** REJECT **") || strings.HasPrefix(v.Content.Description, "[REJECTED CVE]") {
+			return true
+		}
+
+		if len(as) == 0 {
+			return false
+		}
+
+		if len(filterDistroAdvisories(e, s, as)) == 0 {
+			return true
+		}
+
+		return false
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		if strings.HasPrefix(v.Content.Description, "** REJECT **") || strings.HasPrefix(v.Content.Description, "Rejected reason:") {
+			return true
+		}
+
+		if len(as) == 0 {
+			return false
+		}
+
+		if len(filterDistroAdvisories(e, s, as)) == 0 {
+			return true
+		}
+
+		return false
+	default:
+		return false
+	}
+}
+
+func filterDistroAdvisories(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID, as models.DistroAdvisories) models.DistroAdvisories {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeRedHat:
+		var fas models.DistroAdvisories
+		for _, a := range as {
+			if !strings.Contains(a.Description, "** REJECT **") {
+				fas = append(fas, a)
+			}
+		}
+		return fas
+	case ecosystemTypes.EcosystemTypeCPE:
+		switch s {
+		case sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+			// Drop JVN advisories invalidated in place ("** 削除 **" withdrawn,
+			// "** 未確定 **" unconfirmed, "** サポート外 **" unsupported).
+			var fas models.DistroAdvisories
+			for _, a := range as {
+				if strings.Contains(a.Description, "** 削除 **") ||
+					strings.Contains(a.Description, "** 未確定 **") ||
+					strings.Contains(a.Description, "** サポート外 **") {
+					continue
+				}
+				fas = append(fas, a)
+			}
+			return fas
+		default:
+			return as
+		}
+	default:
+		return as
+	}
+
+}
+
+func ignoreCriteria(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID, cn criterionTypes.FilteredCriterion) bool {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeRedHat:
+		switch s {
+		case sourceTypes.RedHatOVALv1, sourceTypes.RedHatOVALv2:
+			// Ignore whole criteria from root if kpatch-patch-* package is included.
+			switch cn.Criterion.Type {
+			case criterionTypes.CriterionTypeVersion:
+				if cn.Criterion.Version != nil &&
+					cn.Criterion.Version.Package.Type == versioncriterionpackageTypes.PackageTypeBinary && cn.Criterion.Version.Package.Binary != nil &&
+					strings.HasPrefix(cn.Criterion.Version.Package.Binary.Name, "kpatch-patch-") {
+					return true
+				}
+				return false
+			case criterionTypes.CriterionTypeNoneExist:
+				if cn.Criterion.NoneExist != nil &&
+					cn.Criterion.NoneExist.Type == noneexistcriterionTypes.PackageTypeBinary && cn.Criterion.NoneExist.Binary != nil &&
+					strings.HasPrefix(cn.Criterion.NoneExist.Binary.Name, "kpatch-patch-") {
+					return true
+				}
+				return false
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func ignoreCriterion(e ecosystemTypes.Ecosystem, cn criterionTypes.FilteredCriterion, tag segmentTypes.DetectionTag) bool {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeRedHat:
+		switch cn.Criterion.Type {
+		case criterionTypes.CriterionTypeVersion:
+			if cn.Criterion.Version != nil && cn.Criterion.Version.FixStatus != nil && cn.Criterion.Version.FixStatus.Class == fixstatusTypes.ClassUnfixed {
+				switch strings.ToLower(cn.Criterion.Version.FixStatus.Vendor) {
+				case "will not fix", "under investigation":
+					return true
+				}
+			}
+			return false
+		default:
+			return false
+		}
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		if func() bool {
+			lhs, _, _ := strings.Cut(string(tag), "_")
+			lhs, rhs, ok := strings.Cut(lhs, "/")
+			if !ok {
+				return false
+			}
+			services := []string{"esm", "esm-infra", "esm-apps", "esm-infra-legacy", "esm-apps-legacy", "ros-esm"}
+			if !slices.Contains(services, lhs) && !slices.Contains(services, rhs) {
+				return true
+			}
+			return false
+		}() {
+			return true
+		}
+
+		switch cn.Criterion.Type {
+		case criterionTypes.CriterionTypeVersion:
+			if cn.Criterion.Version != nil && cn.Criterion.Version.FixStatus != nil && cn.Criterion.Version.FixStatus.Class == fixstatusTypes.ClassUnfixed {
+				lhs, _, _ := strings.Cut(cn.Criterion.Version.FixStatus.Vendor, ":")
+				switch lhs {
+				case "ignored", "in-progress":
+					return true
+				}
+			}
+			return false
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
+func filterCriterion(e ecosystemTypes.Ecosystem, scanned scanTypes.ScanResult, cn criterionTypes.FilteredCriterion) (criterionTypes.FilteredCriterion, error) {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeDebian:
+		switch cn.Criterion.Type {
+		case criterionTypes.CriterionTypeVersion:
+			if cn.Criterion.Version != nil {
+				switch cn.Criterion.Version.Package.Type {
+				case versioncriterionpackageTypes.PackageTypeSource:
+					if !models.IsKernelSourcePackage(constant.Debian, cn.Criterion.Version.Package.Source.Name) {
+						return cn, nil
+					}
+
+					m := make(map[string][]string)
+					for _, p := range scanned.OSPackages {
+						sn := fmt.Sprintf("%s:%d:%s-%s", models.RenameKernelSourcePackageName(constant.Debian, p.SrcName), func() int {
+							if p.SrcEpoch != nil {
+								return *p.SrcEpoch
+							}
+							return 0
+						}(), p.SrcVersion, p.SrcRelease)
+						m[sn] = append(m[sn], p.Name)
+					}
+
+					var accepts []int
+					for _, index := range cn.Accepts.Version {
+						if len(scanned.OSPackages) <= index {
+							return criterionTypes.FilteredCriterion{}, xerrors.Errorf("Too large OSPackage index. len(OSPackage): %d, index: %d", len(scanned.OSPackages), index)
+						}
+
+						if slices.ContainsFunc(m[fmt.Sprintf("%s:%d:%s-%s", models.RenameKernelSourcePackageName(constant.Debian, scanned.OSPackages[index].SrcName), func() int {
+							if scanned.OSPackages[index].SrcEpoch != nil {
+								return *scanned.OSPackages[index].SrcEpoch
+							}
+							return 0
+						}(), scanned.OSPackages[index].SrcVersion, scanned.OSPackages[index].SrcRelease)], func(s string) bool {
+							switch s {
+							case fmt.Sprintf("linux-image-%s", scanned.Kernel.Release), fmt.Sprintf("linux-headers-%s", scanned.Kernel.Release):
+								return true
+							default:
+								return false
+							}
+						}) {
+							accepts = append(accepts, index)
+						}
+					}
+					cn.Accepts.Version = accepts
+
+					return cn, nil
+				default:
+					return cn, nil
+				}
+			}
+			return cn, nil
+		default:
+			return cn, nil
+		}
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		switch cn.Criterion.Type {
+		case criterionTypes.CriterionTypeVersion:
+			if cn.Criterion.Version != nil {
+				switch cn.Criterion.Version.Package.Type {
+				case versioncriterionpackageTypes.PackageTypeSource:
+					if !models.IsKernelSourcePackage(constant.Ubuntu, cn.Criterion.Version.Package.Source.Name) {
+						return cn, nil
+					}
+
+					m := make(map[string][]string)
+					for _, p := range scanned.OSPackages {
+						sn := fmt.Sprintf("%s:%d:%s-%s", models.RenameKernelSourcePackageName(constant.Ubuntu, p.SrcName), func() int {
+							if p.SrcEpoch != nil {
+								return *p.SrcEpoch
+							}
+							return 0
+						}(), p.SrcVersion, p.SrcRelease)
+						m[sn] = append(m[sn], p.Name)
+					}
+
+					var accepts []int
+					for _, index := range cn.Accepts.Version {
+						if len(scanned.OSPackages) <= index {
+							return criterionTypes.FilteredCriterion{}, xerrors.Errorf("Too large OSPackage index. len(OSPackage): %d, index: %d", len(scanned.OSPackages), index)
+						}
+
+						if slices.ContainsFunc(m[fmt.Sprintf("%s:%d:%s-%s", models.RenameKernelSourcePackageName(constant.Ubuntu, scanned.OSPackages[index].SrcName), func() int {
+							if scanned.OSPackages[index].SrcEpoch != nil {
+								return *scanned.OSPackages[index].SrcEpoch
+							}
+							return 0
+						}(), scanned.OSPackages[index].SrcVersion, scanned.OSPackages[index].SrcRelease)], func(s string) bool {
+							switch s {
+							case fmt.Sprintf("linux-image-%s", scanned.Kernel.Release), fmt.Sprintf("linux-image-unsigned-%s", scanned.Kernel.Release), fmt.Sprintf("linux-signed-image-%s", scanned.Kernel.Release), fmt.Sprintf("linux-image-uc-%s", scanned.Kernel.Release),
+								fmt.Sprintf("linux-buildinfo-%s", scanned.Kernel.Release), fmt.Sprintf("linux-cloud-tools-%s", scanned.Kernel.Release), fmt.Sprintf("linux-headers-%s", scanned.Kernel.Release), fmt.Sprintf("linux-lib-rust-%s", scanned.Kernel.Release), fmt.Sprintf("linux-modules-%s", scanned.Kernel.Release), fmt.Sprintf("linux-modules-extra-%s", scanned.Kernel.Release), fmt.Sprintf("linux-modules-ipu6-%s", scanned.Kernel.Release), fmt.Sprintf("linux-modules-ivsc-%s", scanned.Kernel.Release), fmt.Sprintf("linux-modules-iwlwifi-%s", scanned.Kernel.Release), fmt.Sprintf("linux-tools-%s", scanned.Kernel.Release):
+								return true
+							default:
+								if (strings.HasPrefix(s, "linux-modules-nvidia-") || strings.HasPrefix(s, "linux-objects-nvidia-") || strings.HasPrefix(s, "linux-signatures-nvidia-")) && strings.HasSuffix(s, scanned.Kernel.Release) {
+									return true
+								}
+								return false
+							}
+						}) {
+							accepts = append(accepts, index)
+						}
+					}
+					cn.Accepts.Version = accepts
+
+					return cn, nil
+				default:
+					return cn, nil
+				}
+			}
+			return cn, nil
+		default:
+			return cn, nil
+		}
+	default:
+		return cn, nil
+	}
+}
+
+func affectedPackageName(e ecosystemTypes.Ecosystem, pkg scanTypes.OSPackage) string {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	default:
+		return pkg.Name
+	}
+}
+
+func fixState(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID, fixstate string) string {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		switch s {
+		case sourceTypes.UbuntuCVETracker:
+			lhs, _, _ := strings.Cut(fixstate, ":")
+			return lhs
+		default:
+			return fixstate
+		}
+	default:
+		return fixstate
+	}
+}
+
+func selectFixedIn(rangeType vcAffectedRangeTypes.RangeType, fixed []string) string {
+	if len(fixed) == 0 {
+		return ""
+	}
+
+	switch rangeType {
+	case vcAffectedRangeTypes.RangeTypeAPK:
+		return slices.MaxFunc(fixed, func(x, y string) int {
+			vx, errx := apk.NewVersion(x)
+			vy, erry := apk.NewVersion(y)
+			switch {
+			case errx != nil && erry != nil:
+				return 0
+			case errx != nil && erry == nil:
+				return -1
+			case errx == nil && erry != nil:
+				return +1
+			default:
+				return vx.Compare(vy)
+			}
+		})
+	case vcAffectedRangeTypes.RangeTypeRPM:
+		return slices.MaxFunc(fixed, func(x, y string) int {
+			return rpm.NewVersion(x).Compare(rpm.NewVersion(y))
+		})
+	case vcAffectedRangeTypes.RangeTypeDPKG:
+		return slices.MaxFunc(fixed, func(x, y string) int {
+			vx, errx := deb.NewVersion(x)
+			vy, erry := deb.NewVersion(y)
+			switch {
+			case errx != nil && erry != nil:
+				return 0
+			case errx != nil && erry == nil:
+				return -1
+			case errx == nil && erry != nil:
+				return +1
+			default:
+				return vx.Compare(vy)
+			}
+		})
+	default:
+		return fixed[0]
+	}
+}
+
+func comparePackStatus(a, b packStatus) (int, error) {
+	if a.status.Name != b.status.Name {
+		return 0, xerrors.Errorf("Package names are different. a: %s, b: %s", a.status.Name, b.status.Name)
+	}
+
+	if a.rangeType != vcAffectedRangeTypes.RangeTypeUnknown && b.rangeType != vcAffectedRangeTypes.RangeTypeUnknown && a.rangeType != b.rangeType {
+		return 0, xerrors.Errorf("Range types are different. a: %s, b: %s", a.rangeType, b.rangeType)
+	}
+
+	return cmp.Or(
+		func() int {
+			switch {
+			case a.status.NotFixedYet && !b.status.NotFixedYet:
+				return +1
+			case !a.status.NotFixedYet && b.status.NotFixedYet:
+				return -1
+			default:
+				return 0
+			}
+		}(),
+		func() int {
+			if a.rangeType == vcAffectedRangeTypes.RangeTypeUnknown || b.rangeType == vcAffectedRangeTypes.RangeTypeUnknown || a.rangeType != b.rangeType {
+				return 0
+			}
+
+			switch a.rangeType {
+			case vcAffectedRangeTypes.RangeTypeAPK:
+				va, erra := apk.NewVersion(a.status.FixedIn)
+				vb, errb := apk.NewVersion(b.status.FixedIn)
+				switch {
+				case erra != nil && errb != nil:
+					return 0
+				case erra != nil && errb == nil:
+					return -1
+				case erra == nil && errb != nil:
+					return +1
+				default:
+					return va.Compare(vb)
+				}
+			case vcAffectedRangeTypes.RangeTypeRPM:
+				return rpm.NewVersion(a.status.FixedIn).Compare(rpm.NewVersion(b.status.FixedIn))
+			case vcAffectedRangeTypes.RangeTypeDPKG:
+				va, erra := deb.NewVersion(a.status.FixedIn)
+				vb, errb := deb.NewVersion(b.status.FixedIn)
+				switch {
+				case erra != nil && errb != nil:
+					return 0
+				case erra != nil && errb == nil:
+					return -1
+				case erra == nil && errb != nil:
+					return +1
+				default:
+					return va.Compare(vb)
+				}
+			default:
+				return 0
+			}
+		}(),
+	), nil
+}
+
+func advisoryReference(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID, da models.DistroAdvisory) (models.Reference, error) {
+	et, v, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeCPE:
+		switch s {
+		case sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+			ss := strings.Split(da.AdvisoryID, "-")
+			if len(ss) != 3 {
+				return models.Reference{}, xerrors.Errorf("unexpected JVNDB ID: %s", da.AdvisoryID)
+			}
+			return models.Reference{
+				Link:   fmt.Sprintf("https://jvndb.jvn.jp/ja/contents/%s/%s.html", ss[1], da.AdvisoryID),
+				Source: "JVN",
+				RefID:  da.AdvisoryID,
+			}, nil
+		case sourceTypes.FortinetCVRF, sourceTypes.FortinetCSAF:
+			return models.Reference{
+				Link:   fmt.Sprintf("https://www.fortiguard.com/psirt/%s", da.AdvisoryID),
+				Source: "FORTINET",
+				RefID:  da.AdvisoryID,
+			}, nil
+		case sourceTypes.PaloAltoCSAF, sourceTypes.PaloAltoJSON, sourceTypes.PaloAltoList:
+			return models.Reference{
+				Link: func() string {
+					if strings.HasPrefix(da.AdvisoryID, "PAN-CVE-") {
+						return fmt.Sprintf("https://security.paloaltonetworks.com/%s", strings.TrimPrefix(da.AdvisoryID, "PAN-"))
+					}
+					return fmt.Sprintf("https://security.paloaltonetworks.com/%s", da.AdvisoryID)
+				}(),
+				Source: "PALOALTO",
+				RefID:  da.AdvisoryID,
+			}, nil
+		case sourceTypes.CiscoCSAF, sourceTypes.CiscoCVRF, sourceTypes.CiscoJSON:
+			return models.Reference{
+				Link:   fmt.Sprintf("https://sec.cloudapps.cisco.com/security/center/content/CiscoSecurityAdvisory/%s", da.AdvisoryID),
+				Source: "CISCO",
+				RefID:  da.AdvisoryID,
+			}, nil
+		case sourceTypes.AppleSecurityReleases:
+			// The advisory ID is the support article ID, in either the modern
+			// numeric form (128067) or the legacy HT form (HT213823); the
+			// locale-less /<id> URL redirects to the canonical localized page
+			// for both, and legacy IDs are re-pointed at their renumbered
+			// article (HT213823 -> /en-us/106354), which no ID-to-URL rule
+			// could reproduce.
+			return models.Reference{
+				Link:   fmt.Sprintf("https://support.apple.com/%s", da.AdvisoryID),
+				Source: "APPLE",
+				RefID:  da.AdvisoryID,
+			}, nil
+		case sourceTypes.OpenSSHSecurity:
+			// OpenSSH publishes its entire security history on one page and
+			// assigns no per-advisory URL, so every entry points at that page.
+			// The advisory ID is synthesised by the extractor
+			// (OPENSSH-<date>-<n>) and exists only to key the entry, so it is
+			// kept as the RefID rather than built into a link.
+			return models.Reference{
+				Link:   "https://www.openssh.com/security.html",
+				Source: "OPENSSH",
+				RefID:  da.AdvisoryID,
+			}, nil
+		default:
+			return models.Reference{}, xerrors.Errorf("unsupported source: %s", s)
+		}
+	case ecosystemTypes.EcosystemTypeEPEL, ecosystemTypes.EcosystemTypeFedora:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://bodhi.fedoraproject.org/updates/%s", da.AdvisoryID),
+			Source: "FEDORA",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeRedHat:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://access.redhat.com/errata/%s", da.AdvisoryID),
+			Source: "REDHAT",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeAlma:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://errata.almalinux.org/%s/%s.html", v, strings.ReplaceAll(da.AdvisoryID, ":", "-")),
+			Source: "ALMA",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeRocky:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://errata.build.resf.org/%s", da.AdvisoryID),
+			Source: "ROCKY",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeOracle:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://linux.oracle.com/errata/%s.html", da.AdvisoryID),
+			Source: "ORACLE",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeAmazon:
+		return models.Reference{
+			Link: func() string {
+				switch {
+				case strings.HasPrefix(da.AdvisoryID, "ALAS2023"):
+					return fmt.Sprintf("https://alas.aws.amazon.com/AL2023/ALAS%s.html", strings.TrimPrefix(da.AdvisoryID, "ALAS2023"))
+				case strings.HasPrefix(da.AdvisoryID, "ALAS2022"):
+					return fmt.Sprintf("https://alas.aws.amazon.com/AL2022/ALAS%s.html", strings.TrimPrefix(da.AdvisoryID, "ALAS2022"))
+				case strings.HasPrefix(da.AdvisoryID, "ALAS2"):
+					return fmt.Sprintf("https://alas.aws.amazon.com/AL2/ALAS%s.html", strings.TrimPrefix(da.AdvisoryID, "ALAS2"))
+				default:
+					return fmt.Sprintf("https://alas.aws.amazon.com/ALAS%s.html", strings.TrimPrefix(da.AdvisoryID, "ALAS"))
+				}
+			}(),
+			Source: "AMAZON",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeDebian:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://security-tracker.debian.org/tracker/%s", da.AdvisoryID),
+			Source: "DEBIAN",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://ubuntu.com/security/notices/%s", da.AdvisoryID),
+			Source: "UBUNTU",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeSUSELinuxEnterprise, ecosystemTypes.EcosystemTypeOpenSUSE, ecosystemTypes.EcosystemTypeOpenSUSELeap, ecosystemTypes.EcosystemTypeOpenSUSETumbleweed:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://www.suse.com/security/cve/%s.html", da.AdvisoryID),
+			Source: "SUSE",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeMicrosoft:
+		return models.Reference{
+			Link:   fmt.Sprintf("https://msrc.microsoft.com/update-guide/vulnerability/%s", da.AdvisoryID),
+			Source: "MICROSOFT",
+			RefID:  da.AdvisoryID,
+		}, nil
+	case ecosystemTypes.EcosystemTypeSolaris:
+		// The advisory id is the slug of the public Oracle security alert
+		// page (bulletinjul2026, cpujul2026).
+		return models.Reference{
+			Link:   fmt.Sprintf("https://www.oracle.com/security-alerts/%s.html", da.AdvisoryID),
+			Source: "ORACLE",
+			RefID:  da.AdvisoryID,
+		}, nil
+	default:
+		return models.Reference{}, xerrors.Errorf("unsupported family: %s", et)
+	}
+}
+
+// cveContentOptional builds the per-source CveContent.Optional map. Every
+// ecosystem records the vuls2-sources trace; ecosystem-specific extras are
+// added per case. Microsoft surfaces the MSRC exploitability assessment
+// ("Publicly Disclosed:...;Exploited:...;...") under "exploit", mirroring the
+// legacy gost Microsoft path (gost/microsoft.go: Optional["exploit"] =
+// cve.ExploitStatus). vuls-data-update extracts it as the advisory-level
+// "exploitability" optional value on the CVRF vulnerability content.
+func cveContentOptional(e ecosystemTypes.Ecosystem, v vulnerabilityTypes.Vulnerability, sources string) map[string]string {
+	m := map[string]string{"vuls2-sources": sources}
+
+	et, _, _ := strings.Cut(string(e), ":")
+	switch et {
+	case ecosystemTypes.EcosystemTypeMicrosoft:
+		if ex, ok := v.Content.Optional["exploitability"].(string); ok && ex != "" {
+			m["exploit"] = ex
+		}
+	}
+	return m
+}
+
+func cveContentSourceLink(ccType models.CveContentType, v vulnerabilityTypes.Vulnerability, rootID dataTypes.RootID) string {
+	switch ccType {
+	case models.Cisco:
+		// Cisco content lives in the advisory, whose ID is the root ID, so the
+		// per-CVE source link points at that advisory page.
+		return fmt.Sprintf("https://sec.cloudapps.cisco.com/security/center/content/CiscoSecurityAdvisory/%s", rootID)
+	case models.OpenSSH:
+		// OpenSSH has no per-advisory page: the whole security history is one
+		// document, so every CVE's source link points at it.
+		return "https://www.openssh.com/security.html"
+	case models.Paloalto:
+		// Palo Alto publishes a page per CVE, so the source link is keyed by the
+		// CVE ID (which is the vulnerability content ID, e.g. CVE-2022-0778).
+		return fmt.Sprintf("https://security.paloaltonetworks.com/%s", v.Content.ID)
+	case models.Fortinet:
+		// Fortinet content lives in the PSIRT advisory, whose ID is the root ID
+		// (e.g. FG-IR-24-041), so the per-CVE source link points at that page.
+		return fmt.Sprintf("https://www.fortiguard.com/psirt/%s", rootID)
+	case models.Apple:
+		// Apple content lives in the security release page, whose support
+		// article ID is the root ID (e.g. 128067 or the legacy HT213823), so
+		// the per-CVE source link points at that page. The per-CVE references
+		// the extractor emits point at cve.org, not at Apple.
+		return fmt.Sprintf("https://support.apple.com/%s", rootID)
+	case models.Jvn:
+		// JVN content sits under a JVNDB-<year>-<seq> root; the source link
+		// points at that advisory page, whose URL embeds the year.
+		ss := strings.Split(string(rootID), "-")
+		if len(ss) != 3 {
+			return ""
+		}
+		return fmt.Sprintf("https://jvndb.jvn.jp/ja/contents/%s/%s.html", ss[1], rootID)
+	case models.RedHat, models.RedHatAPI:
+		return fmt.Sprintf("https://access.redhat.com/security/cve/%s", v.Content.ID)
+	case models.Oracle:
+		return fmt.Sprintf("https://linux.oracle.com/cve/%s.html", v.Content.ID)
+	case models.Amazon:
+		return fmt.Sprintf("https://explore.alas.aws.amazon.com/%s.html", v.Content.ID)
+	case models.SUSE:
+		return fmt.Sprintf("https://www.suse.com/security/cve/%s.html", v.Content.ID)
+	case models.Debian, models.DebianSecurityTracker:
+		return fmt.Sprintf("https://security-tracker.debian.org/tracker/%s", v.Content.ID)
+	case models.Ubuntu, models.UbuntuAPI:
+		return fmt.Sprintf("https://ubuntu.com/security/%s", v.Content.ID)
+	case models.Alpine:
+		return fmt.Sprintf("https://security.alpinelinux.org/vuln/%s", v.Content.ID)
+	case models.Nvd:
+		return fmt.Sprintf("https://nvd.nist.gov/vuln/detail/%s", v.Content.ID)
+	case models.Vulncheck:
+		return fmt.Sprintf("https://console.vulncheck.com/cve/%s", v.Content.ID)
+	case models.Mitre:
+		return fmt.Sprintf("https://www.cve.org/CVERecord?id=%s", v.Content.ID)
+	case models.Microsoft:
+		return fmt.Sprintf("https://msrc.microsoft.com/update-guide/vulnerability/%s", v.Content.ID)
+	case models.Solaris:
+		// Oracle publishes Solaris fixes per advisory (a quarterly Third Party
+		// Bulletin or Critical Patch Update), whose public URL slug is the
+		// root ID (e.g. bulletinjul2026, cpujul2026), so the per-CVE source
+		// link points at that advisory page.
+		return fmt.Sprintf("https://www.oracle.com/security-alerts/%s.html", rootID)
+	default:
+		return ""
+	}
+}
+
+func compareSource(a, b source) int {
+	preferenceFn := func(e ecosystemTypes.Ecosystem) int {
+		et, _, _ := strings.Cut(string(e), ":")
+
+		switch et {
+		case ecosystemTypes.EcosystemTypeCPE:
+			return 0
+		case ecosystemTypes.EcosystemTypeEPEL:
+			return 1
+		default:
+			return 2
+		}
+	}
+	return cmp.Or(
+		cmp.Compare(preferenceFn(a.Segment.Ecosystem), preferenceFn(b.Segment.Ecosystem)),
+		compareSourceID(a.Segment.Ecosystem, a.SourceID, b.SourceID),
+		compareTag(a.Segment.Ecosystem, a.SourceID, a.Segment.Tag, b.Segment.Tag),
+		cmp.Compare(a.RootID, b.RootID),
+		cmp.Compare(a.Segment.Tag, b.Segment.Tag),
+	)
+}
+
+func compareSourceID(e ecosystemTypes.Ecosystem, a, b sourceTypes.SourceID) int {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeCPE:
+		preferenceFn := func(sourceID sourceTypes.SourceID) int {
+			switch sourceID {
+			case sourceTypes.NVDAPICVE, sourceTypes.JVNFeedDetail, sourceTypes.FortinetCSAF, sourceTypes.PaloAltoCSAF, sourceTypes.CiscoCSAF:
+				return 5
+			case sourceTypes.NVDFeedCVEv2, sourceTypes.JVNFeedRSS, sourceTypes.FortinetCVRF, sourceTypes.PaloAltoJSON, sourceTypes.CiscoCVRF:
+				return 4
+			case sourceTypes.NVDFeedCVEv1:
+				return 3
+			case sourceTypes.PaloAltoList, sourceTypes.CiscoJSON:
+				return 2
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(a), preferenceFn(b))
+	case ecosystemTypes.EcosystemTypeRedHat:
+		preferenceFn := func(sourceID sourceTypes.SourceID) int {
+			switch sourceID {
+			case sourceTypes.RedHatCSAF:
+				return 5
+			case sourceTypes.RedHatVEXv1:
+				return 4
+			case sourceTypes.RedHatOVALv2:
+				return 3
+			case sourceTypes.RedHatOVALv1:
+				return 2
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(a), preferenceFn(b))
+	case ecosystemTypes.EcosystemTypeAlma:
+		preferenceFn := func(sourceID sourceTypes.SourceID) int {
+			switch sourceID {
+			case sourceTypes.AlmaErrata:
+				return 4
+			case sourceTypes.AlmaOVAL:
+				return 3
+			case sourceTypes.AlmaOSV:
+				return 2
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(a), preferenceFn(b))
+	case ecosystemTypes.EcosystemTypeRocky:
+		preferenceFn := func(sourceID sourceTypes.SourceID) int {
+			switch sourceID {
+			case sourceTypes.RockyErrata:
+				return 3
+			case sourceTypes.RockyOSV:
+				return 2
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(a), preferenceFn(b))
+	case ecosystemTypes.EcosystemTypeAlpine:
+		preferenceFn := func(sourceID sourceTypes.SourceID) int {
+			switch sourceID {
+			case sourceTypes.AlpineSecDB:
+				return 3
+			case sourceTypes.AlpineOSV:
+				return 2
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(a), preferenceFn(b))
+	case ecosystemTypes.EcosystemTypeDebian:
+		preferenceFn := func(sourceID sourceTypes.SourceID) int {
+			switch sourceID {
+			case sourceTypes.DebianSecurityTrackerSalsa:
+				return 5
+			case sourceTypes.DebianSecurityTrackerAPI:
+				return 4
+			case sourceTypes.DebianOVAL:
+				return 3
+			case sourceTypes.DebianOSV:
+				return 2
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(a), preferenceFn(b))
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		preferenceFn := func(sourceID sourceTypes.SourceID) int {
+			switch sourceID {
+			case sourceTypes.UbuntuCVETracker:
+				return 4
+			case sourceTypes.UbuntuOVAL:
+				return 3
+			case sourceTypes.UbuntuOSV:
+				return 2
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(a), preferenceFn(b))
+	case ecosystemTypes.EcosystemTypeMicrosoft:
+		preferenceFn := func(sourceID sourceTypes.SourceID) int {
+			switch sourceID {
+			case sourceTypes.MicrosoftCVRF:
+				return 5
+			case sourceTypes.MicrosoftCSAF:
+				return 4
+			case sourceTypes.MicrosoftBulletin:
+				return 3
+			case sourceTypes.MicrosoftWSUSSCN2, sourceTypes.MicrosoftMSUC:
+				return 2
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(a), preferenceFn(b))
+	default:
+		return 0
+	}
+}
+
+func compareTag(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID, a, b segmentTypes.DetectionTag) int {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeRedHat:
+		preferenceFn := func(sourceID sourceTypes.SourceID, tag segmentTypes.DetectionTag) int {
+			switch sourceID {
+			case sourceTypes.RedHatOVALv2:
+				switch {
+				case strings.HasSuffix(string(tag), "-including-unpatched"):
+					return 4
+				case strings.HasSuffix(string(tag), "-extras-including-unpatched"):
+					return 3
+				case strings.HasSuffix(string(tag), "-supplementary"):
+					return 2
+				default:
+					return 1
+				}
+			case sourceTypes.RedHatCSAF, sourceTypes.RedHatVEXv1:
+				lhs, _, _ := strings.Cut(string(tag), ":")
+				switch {
+				case strings.HasSuffix(lhs, "-including-unpatched"):
+					return 4
+				case strings.HasSuffix(lhs, "-extras-including-unpatched"):
+					return 3
+				case strings.HasSuffix(lhs, "-supplementary"):
+					return 2
+				default:
+					return 1
+				}
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(s, a), preferenceFn(s, b))
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		preferenceFn := func(sourceID sourceTypes.SourceID, tag segmentTypes.DetectionTag) int {
+			switch sourceID {
+			case sourceTypes.UbuntuCVETracker:
+				switch {
+				case !strings.Contains(string(tag), "/"):
+					return 2
+				default:
+					return 1
+				}
+			default:
+				return 1
+			}
+		}
+		return cmp.Compare(preferenceFn(s, a), preferenceFn(s, b))
+	default:
+		return 0
+	}
+}
+
+func toCveContentType(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID) models.CveContentType {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeCPE:
+		switch s {
+		case sourceTypes.NVDAPICVE, sourceTypes.NVDFeedCVEv1, sourceTypes.NVDFeedCVEv2:
+			return models.Nvd
+		case sourceTypes.VulnCheckNISTNVD2:
+			return models.Vulncheck
+		case sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+			return models.Jvn
+		case sourceTypes.FortinetCVRF, sourceTypes.FortinetCSAF:
+			return models.Fortinet
+		case sourceTypes.PaloAltoCSAF, sourceTypes.PaloAltoJSON, sourceTypes.PaloAltoList:
+			return models.Paloalto
+		case sourceTypes.CiscoCSAF, sourceTypes.CiscoCVRF, sourceTypes.CiscoJSON:
+			return models.Cisco
+		case sourceTypes.AppleSecurityReleases:
+			return models.Apple
+		case sourceTypes.OpenSSHSecurity:
+			return models.OpenSSH
+		default:
+			return models.Unknown
+		}
+	case ecosystemTypes.EcosystemTypeEPEL:
+		return models.CveContentType("epel")
+	case ecosystemTypes.EcosystemTypeDebian:
+		switch s {
+		case sourceTypes.DebianSecurityTrackerSalsa, sourceTypes.DebianSecurityTrackerAPI:
+			return models.DebianSecurityTracker
+		default:
+			return models.Debian
+		}
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		switch s {
+		case sourceTypes.UbuntuCVETracker:
+			return models.UbuntuAPI
+		default:
+			return models.Ubuntu
+		}
+	case ecosystemTypes.EcosystemTypeSUSELinuxEnterprise, ecosystemTypes.EcosystemTypeOpenSUSE, ecosystemTypes.EcosystemTypeOpenSUSELeap, ecosystemTypes.EcosystemTypeOpenSUSETumbleweed:
+		return models.SUSE
+	case ecosystemTypes.EcosystemTypeMicrosoft:
+		return models.Microsoft
+	case ecosystemTypes.EcosystemTypeSolaris:
+		return models.Solaris
+	default:
+		return models.NewCveContentType(et)
+	}
+}
+
+func toCvss(e ecosystemTypes.Ecosystem, src sourceTypes.SourceID, ss []severityTypes.Severity) (v2.CVSSv2, v31.CVSSv31, v40.CVSSv40) {
+	var (
+		cvss2 v2.CVSSv2
+		cvss3 v31.CVSSv31
+		cvss4 v40.CVSSv40
+	)
+
+	for _, s := range ss {
+		et, _, _ := strings.Cut(string(e), ":")
+		switch s.Type {
+		case severityTypes.SeverityTypeVendor:
+			switch et {
+			case ecosystemTypes.EcosystemTypeDebian:
+				switch src {
+				case sourceTypes.DebianSecurityTrackerSalsa, sourceTypes.DebianSecurityTrackerAPI:
+					if s.Vendor != nil {
+						cvss2 = v2.CVSSv2{NVDBaseSeverity: *s.Vendor}
+						cvss3 = v31.CVSSv31{BaseSeverity: *s.Vendor}
+					}
+				default:
+				}
+			case ecosystemTypes.EcosystemTypeUbuntu:
+				switch src {
+				case sourceTypes.UbuntuCVETracker:
+					if s.Vendor != nil {
+						cvss2 = v2.CVSSv2{NVDBaseSeverity: *s.Vendor}
+						cvss3 = v31.CVSSv31{BaseSeverity: *s.Vendor}
+					}
+				default:
+				}
+			case ecosystemTypes.EcosystemTypeSUSELinuxEnterprise, ecosystemTypes.EcosystemTypeOpenSUSE, ecosystemTypes.EcosystemTypeOpenSUSELeap, ecosystemTypes.EcosystemTypeOpenSUSETumbleweed:
+				if s.Vendor != nil {
+					if cvss2.Vector != "" {
+						cvss2.NVDBaseSeverity = *s.Vendor
+					}
+					if cvss3.Vector != "" {
+						cvss3.BaseSeverity = *s.Vendor
+					}
+					if cvss4.Vector != "" {
+						cvss4.Severity = *s.Vendor
+					}
+				}
+			default:
+			}
+		case severityTypes.SeverityTypeCVSSv2:
+			switch et {
+			case ecosystemTypes.EcosystemTypeSUSELinuxEnterprise, ecosystemTypes.EcosystemTypeOpenSUSE, ecosystemTypes.EcosystemTypeOpenSUSELeap, ecosystemTypes.EcosystemTypeOpenSUSETumbleweed:
+				if s.Source != "SUSE" {
+					continue
+				}
+			default:
+			}
+			if cvss2.Vector == "" && s.CVSSv2 != nil {
+				cvss2 = *s.CVSSv2
+			}
+		case severityTypes.SeverityTypeCVSSv30:
+			switch et {
+			case ecosystemTypes.EcosystemTypeSUSELinuxEnterprise, ecosystemTypes.EcosystemTypeOpenSUSE, ecosystemTypes.EcosystemTypeOpenSUSELeap, ecosystemTypes.EcosystemTypeOpenSUSETumbleweed:
+				if s.Source != "SUSE" {
+					continue
+				}
+			default:
+			}
+			if cvss3.Vector == "" && s.CVSSv30 != nil {
+				cvss3 = v31.CVSSv31{
+					Vector:       s.CVSSv30.Vector,
+					BaseScore:    s.CVSSv30.BaseScore,
+					BaseSeverity: s.CVSSv30.BaseSeverity,
+				}
+			}
+		case severityTypes.SeverityTypeCVSSv31:
+			switch et {
+			case ecosystemTypes.EcosystemTypeSUSELinuxEnterprise, ecosystemTypes.EcosystemTypeOpenSUSE, ecosystemTypes.EcosystemTypeOpenSUSELeap, ecosystemTypes.EcosystemTypeOpenSUSETumbleweed:
+				if s.Source != "SUSE" {
+					continue
+				}
+			default:
+			}
+			if !strings.HasPrefix(cvss3.Vector, "CVSS:3.1/") && s.CVSSv31 != nil {
+				cvss3 = *s.CVSSv31
+			}
+		case severityTypes.SeverityTypeCVSSv40:
+			switch et {
+			case ecosystemTypes.EcosystemTypeSUSELinuxEnterprise, ecosystemTypes.EcosystemTypeOpenSUSE, ecosystemTypes.EcosystemTypeOpenSUSELeap, ecosystemTypes.EcosystemTypeOpenSUSETumbleweed:
+				if s.Source != "SUSE" {
+					continue
+				}
+			default:
+			}
+			if cvss4.Vector == "" && s.CVSSv40 != nil {
+				cvss4 = *s.CVSSv40
+			}
+		default:
+		}
+	}
+
+	return cvss2, cvss3, cvss4
+}
+
+// toVuls0Confidence maps a source's detection of one VulnInfo to a vuls0
+// Confidence. cm is that VulnInfo's own CPE matches from this source
+// (sourceData.cpes[id]) — a confidence describes one source's evidence for one
+// CVE, so it must never be judged from matches recorded for a sibling ID. It
+// is consulted only for the cpe ecosystem.
+func toVuls0Confidence(e ecosystemTypes.Ecosystem, s sourceTypes.SourceID, cm cpeMatches) models.Confidence {
+	et, _, _ := strings.Cut(string(e), ":")
+
+	switch et {
+	case ecosystemTypes.EcosystemTypeCPE:
+		// CPE confidences are two-valued: *ExactVersionMatch (100) or
+		// *VendorProductMatch (10). go-cve-dictionary's middle tier,
+		// *RoughVersionMatch (80), is deliberately retired: it marked
+		// matches whose versions semver could not compare and that only an
+		// RPM-style comparison placed in range — a fallback go-cve-
+		// dictionary itself documented as false-positive-prone — yet its
+		// score 80 sailed past downstream low-confidence cutoffs (which
+		// typically drop score <= 10) as if it were a solid match. Those
+		// fuzzy hits now surface as VendorProductMatch, honestly low and
+		// filterable, while cpematch-expanded criteria give most products a
+		// true exact match instead.
+		//
+		// A source whose every CPE accept for this VulnInfo is
+		// version-unconfirmed (cm.vp populated but cm.exact empty) reports the
+		// low *VendorProductMatch confidence — the vuls2 counterpart of
+		// go-cve-dictionary's VendorProductMatch — instead of the exact-match
+		// one. CPE matches are the only detection signal a cpe-ecosystem
+		// source can carry (packStatuses / kbIDs come from Version / KB
+		// criteria, which never appear under this ecosystem).
+		if len(cm.exact) == 0 && len(cm.vp) > 0 {
+			switch s {
+			case sourceTypes.NVDAPICVE, sourceTypes.NVDFeedCVEv1, sourceTypes.NVDFeedCVEv2:
+				return models.NvdVendorProductMatch
+			case sourceTypes.VulnCheckNISTNVD2:
+				return models.VulncheckVendorProductMatch
+			case sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+				return models.JvnVendorProductMatch
+			case sourceTypes.FortinetCVRF, sourceTypes.FortinetCSAF:
+				return models.FortinetVendorProductMatch
+			case sourceTypes.PaloAltoCSAF, sourceTypes.PaloAltoJSON, sourceTypes.PaloAltoList:
+				return models.PaloaltoVendorProductMatch
+			case sourceTypes.CiscoCSAF, sourceTypes.CiscoCVRF, sourceTypes.CiscoJSON:
+				return models.CiscoVendorProductMatch
+			case sourceTypes.AppleSecurityReleases:
+				return models.AppleVendorProductMatch
+			case sourceTypes.OpenSSHSecurity:
+				return models.OpenSSHVendorProductMatch
+			default:
+				return models.Confidence{
+					Score:           0,
+					DetectionMethod: models.DetectionMethod("unknown"),
+					SortOrder:       100,
+				}
+			}
+		}
+
+		switch s {
+		case sourceTypes.NVDAPICVE, sourceTypes.NVDFeedCVEv1, sourceTypes.NVDFeedCVEv2:
+			return models.NvdExactVersionMatch
+		case sourceTypes.VulnCheckNISTNVD2:
+			return models.VulncheckExactVersionMatch
+		case sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+			// walkCPECriteria demotes every JVN match to the vendor:product
+			// tier (isJVNCPESource), so a detected JVN VulnInfo always lands
+			// in the VendorProductMatch branch above. This case is reached
+			// only for a JVN VulnInfo with no matches of its own (cm empty,
+			// e.g. a suppressed sibling CVE of a multi-CVE root), which
+			// postConvert drops as undetectable. Mapped to
+			// JvnVendorProductMatch for safety should that ever change.
+			return models.JvnVendorProductMatch
+		case sourceTypes.FortinetCVRF, sourceTypes.FortinetCSAF:
+			return models.FortinetExactVersionMatch
+		case sourceTypes.PaloAltoCSAF, sourceTypes.PaloAltoJSON, sourceTypes.PaloAltoList:
+			return models.PaloaltoExactVersionMatch
+		case sourceTypes.CiscoCSAF, sourceTypes.CiscoCVRF, sourceTypes.CiscoJSON:
+			return models.CiscoExactVersionMatch
+		case sourceTypes.AppleSecurityReleases:
+			return models.AppleExactVersionMatch
+		case sourceTypes.OpenSSHSecurity:
+			return models.OpenSSHExactVersionMatch
+		default:
+			return models.Confidence{
+				Score:           0,
+				DetectionMethod: models.DetectionMethod("unknown"),
+				SortOrder:       100,
+			}
+		}
+	case ecosystemTypes.EcosystemTypeEPEL:
+		return models.Confidence{
+			Score:           100,
+			DetectionMethod: models.DetectionMethod("EPELMatch"),
+			SortOrder:       1,
+		}
+	case ecosystemTypes.EcosystemTypeRedHat, ecosystemTypes.EcosystemTypeFedora, ecosystemTypes.EcosystemTypeAlma, ecosystemTypes.EcosystemTypeRocky, ecosystemTypes.EcosystemTypeOracle, ecosystemTypes.EcosystemTypeAmazon,
+		ecosystemTypes.EcosystemTypeSUSELinuxEnterprise, ecosystemTypes.EcosystemTypeOpenSUSE, ecosystemTypes.EcosystemTypeOpenSUSELeap, ecosystemTypes.EcosystemTypeOpenSUSETumbleweed, ecosystemTypes.EcosystemTypeAlpine:
+		return models.OvalMatch
+	case ecosystemTypes.EcosystemTypeSolaris:
+		return models.OracleSolarisAdvisoryMatch
+	case ecosystemTypes.EcosystemTypeDebian:
+		switch s {
+		case sourceTypes.DebianSecurityTrackerSalsa, sourceTypes.DebianSecurityTrackerAPI:
+			return models.DebianSecurityTrackerMatch
+		default:
+			return models.OvalMatch
+		}
+	case ecosystemTypes.EcosystemTypeUbuntu:
+		switch s {
+		case sourceTypes.UbuntuCVETracker:
+			return models.UbuntuAPIMatch
+		default:
+			return models.OvalMatch
+		}
+	case ecosystemTypes.EcosystemTypeMicrosoft:
+		return models.WindowsUpdateSearch
+	default:
+		return models.Confidence{
+			Score:           0,
+			DetectionMethod: models.DetectionMethod("unknown"),
+			SortOrder:       100,
+		}
+	}
+}
+
+// splitCveContentBySource expands base into one CveContent per severity/CWE
+// source. NVD (and VulnCheck's NVD++ mirror) publish both the CNA's metrics and
+// their own analysis for the same CVE, distinguished only by
+// severityTypes.Severity.Source; collapsing them into a single CveContent keeps
+// whichever the source-ordered severity sort happens to put first, which
+// depends on the CNA's source identifier rather than on any preference. Each
+// returned entry keeps base's shared fields (title, summary, references, source
+// link, dates) and carries only its own source's CVSS and CWE IDs, labelled by
+// Optional["source"] — the shape go-cve-dictionary's ConvertNvdToModel /
+// ConvertVulncheckToModel produced before NVD and VulnCheck moved to the vuls2
+// DB. base is returned as-is when there is neither severity nor CWE to
+// attribute, so a content without metrics is still reported.
+//
+// toCvss selects the CVSS of one source's severities; callers pass the selector
+// matching their path (enrichCvss for the enrich passes, toCvss for the CPE
+// detection path) so the split changes only the grouping, not the selection.
+func splitCveContentBySource(base models.CveContent, ss []severityTypes.Severity, cwes []cweTypes.CWE, toCvss func([]severityTypes.Severity) (v2.CVSSv2, v31.CVSSv31, v40.CVSSv40)) []models.CveContent {
+	type bySource struct {
+		source     string
+		severities []severityTypes.Severity
+		cweIDs     []string
+	}
+	// Groups stay in the order their source is first seen, so the entries
+	// follow the severity/CWE order the data carries instead of a second
+	// ordering imposed here (CveContents.Sort normalizes the output — see
+	// ScanResult.SortForJSONOutput).
+	var bss []bySource
+	index := func(source string) int {
+		if i := slices.IndexFunc(bss, func(b bySource) bool { return b.source == source }); i >= 0 {
+			return i
+		}
+		bss = append(bss, bySource{source: source})
+		return len(bss) - 1
+	}
+	for _, s := range ss {
+		i := index(s.Source)
+		bss[i].severities = append(bss[i].severities, s)
+	}
+	for _, c := range cwes {
+		i := index(c.Source)
+		bss[i].cweIDs = append(bss[i].cweIDs, c.CWE...)
+	}
+	if len(bss) == 0 {
+		return []models.CveContent{base}
+	}
+
+	ccs := make([]models.CveContent, 0, len(bss))
+	for _, b := range bss {
+		source := b.source
+		cvss2, cvss3, cvss40 := toCvss(b.severities)
+
+		cc := base
+		cc.Cvss2Score = cvss2.BaseScore
+		cc.Cvss2Vector = cvss2.Vector
+		cc.Cvss2Severity = cvss2.NVDBaseSeverity
+		cc.Cvss3Score = cvss3.BaseScore
+		cc.Cvss3Vector = cvss3.Vector
+		cc.Cvss3Severity = cvss3.BaseSeverity
+		cc.Cvss40Score = cvss40.Score
+		cc.Cvss40Vector = cvss40.Vector
+		cc.Cvss40Severity = cvss40.Severity
+		cc.CweIDs = b.cweIDs
+		if source != "" {
+			// Clone rather than mutate: base.Optional is shared by every entry.
+			o := maps.Clone(base.Optional)
+			if o == nil {
+				o = make(map[string]string)
+			}
+			o["source"] = source
+			cc.Optional = o
+		}
+		ccs = append(ccs, cc)
+	}
+	return ccs
+}
+
+// enrichCvss extracts CVSS scores from severity data without ecosystem-specific handling.
+func enrichCvss(ss []severityTypes.Severity) (v2.CVSSv2, v31.CVSSv31, v40.CVSSv40) {
+	var (
+		cvss2  v2.CVSSv2
+		cvss3  v31.CVSSv31
+		cvss4  v40.CVSSv40
+		vendor string
+	)
+
+	for _, s := range ss {
+		switch s.Type {
+		case severityTypes.SeverityTypeVendor:
+			if s.Vendor != nil {
+				vendor = *s.Vendor
+			}
+		case severityTypes.SeverityTypeCVSSv2:
+			if cvss2.Vector == "" && s.CVSSv2 != nil {
+				cvss2 = *s.CVSSv2
+			}
+		case severityTypes.SeverityTypeCVSSv30:
+			if cvss3.Vector == "" && s.CVSSv30 != nil {
+				cvss3 = v31.CVSSv31{
+					Vector:       s.CVSSv30.Vector,
+					BaseScore:    s.CVSSv30.BaseScore,
+					BaseSeverity: s.CVSSv30.BaseSeverity,
+				}
+			}
+		case severityTypes.SeverityTypeCVSSv31:
+			if !strings.HasPrefix(cvss3.Vector, "CVSS:3.1/") && s.CVSSv31 != nil {
+				cvss3 = *s.CVSSv31
+			}
+		case severityTypes.SeverityTypeCVSSv40:
+			if cvss4.Vector == "" && s.CVSSv40 != nil {
+				cvss4 = *s.CVSSv40
+			}
+		default:
+		}
+	}
+
+	if vendor != "" {
+		if cvss2.Vector != "" {
+			cvss2.NVDBaseSeverity = vendor
+		}
+		if cvss3.Vector != "" {
+			cvss3.BaseSeverity = vendor
+		}
+		if cvss4.Vector != "" {
+			cvss4.Severity = vendor
+		}
+	}
+
+	return cvss2, cvss3, cvss4
+}
+
+// enrichVulnerabilities enriches VulnInfo with vulnerability-based data (CveContent + KEV).
+func enrichVulnerabilities(vi *models.VulnInfo, vulns []dbTypes.VulnerabilityDataVulnerability) {
+	for _, v := range vulns {
+		for sourceID, rootMap := range v.Contents {
+			switch sourceID {
+			case sourceTypes.CISAKEV, sourceTypes.VulnCheckKEV:
+				vi.KEVs = append(vi.KEVs, enrichVulnerabilityKEV(sourceID, rootMap)...)
+			case sourceTypes.RedHatCVE:
+				enrichRedHatCVE(vi, rootMap)
+			case sourceTypes.NVDFeedCVEv2:
+				enrichNVD(vi, rootMap)
+			case sourceTypes.VulnCheckNISTNVD2:
+				enrichVulnCheck(vi, rootMap)
+			case sourceTypes.MitreCVEV5:
+				enrichMitreCVE(vi, rootMap)
+			case sourceTypes.Metasploit:
+				enrichMetasploit(vi, rootMap)
+			case sourceTypes.ExploitExploitDB, sourceTypes.ExploitGitHub, sourceTypes.ExploitInTheWild, sourceTypes.ExploitTrickest, sourceTypes.NucleiRepository:
+				vi.Exploits = append(vi.Exploits, enrichExploits(sourceID, rootMap)...)
+			}
+		}
+	}
+}
+
+// enrichAdvisories enriches VulnInfo with advisory-based data (KEV, EUVD).
+func enrichAdvisories(vi *models.VulnInfo, advisories []dbTypes.VulnerabilityDataAdvisory) {
+	for _, a := range advisories {
+		for sourceID, rootMap := range a.Contents {
+			switch sourceID {
+			case sourceTypes.ENISAKEV:
+				vi.KEVs = append(vi.KEVs, enrichAdvisoryKEV(rootMap)...)
+			case sourceTypes.ENISAEUVDList:
+				enrichEuvd(vi, rootMap)
+			case sourceTypes.JVNFeedRSS, sourceTypes.JVNFeedDetail:
+				enrichJVN(vi, rootMap)
+			}
+		}
+	}
+}
+
+// enrichJVN adds a minimal JVN (jvn-feed-rss / jvn-feed-detail) CveContent — only
+// the JVNDB note's source link — plus JP-CERT alerts. It runs per CVE (enrich
+// fetches by CVE ID), so JVN is not lost for CVEs that have JVN data but were NOT
+// detected via JVN (e.g. package / RedHat-detected CVEs); this matches
+// go-cve-dictionary, whose by-CVE-ID fill surfaced JVN regardless of detector (the
+// JVNDB DistroAdvisory is only emitted when JVN is itself a detection basis).
+//
+// When JVN WAS the detection basis, the postConvert path already produced a richer
+// Jvn CveContent under the same JVNDB source link (carrying the vulnerability
+// content's per-CVE references); that entry is kept and this one is skipped. Only
+// the source link is carried here: JVN's title/summary/CVSS/CWE and the advisory's
+// references are note-level (one JVNDB note often covers several CVEs), so they are
+// not distributed per-CVE — they live in the JVNDB DistroAdvisory and at the linked
+// JVNDB page, and per-CVE CVSS/CWE come from NVD.
+//
+// JP-CERT alerts mirror go-cve-dictionary's fillCertAlerts. go-cve selected JVN
+// references whose source was "JPCERT-AT"; the vuls2 jvn extractor flattens that
+// per-reference source to "jvndb.jvn.jp", but the URL is preserved and every
+// JPCERT-AT reference is a JPCERT/CC alert (www.jpcert.or.jp/at/...), so the URL
+// identifies them equivalently.
+func enrichJVN(vi *models.VulnInfo, rootMap map[dataTypes.RootID][]advisoryTypes.Advisory) {
+	for _, advisories := range rootMap {
+		for _, a := range advisories {
+			// JVNDB-<year>-<seq>; the advisory page URL embeds the year.
+			ss := strings.Split(string(a.Content.ID), "-")
+			if len(ss) != 3 {
+				continue
+			}
+			sourceLink := fmt.Sprintf("https://jvndb.jvn.jp/ja/contents/%s/%s.html", ss[1], a.Content.ID)
+
+			for _, r := range a.Content.References {
+				if !strings.Contains(r.URL, "jpcert.or.jp/at/") {
+					continue
+				}
+				// Prefer the per-reference JPCERT-AT alert-page title the jvn
+				// extractor fetched (stored under Optional["reference_titles"] as a
+				// url->title map; vuls-data-update #896); one JVNDB note often covers
+				// several alerts, so its note-level a.Content.Title is not the alert's
+				// own title. The extractor writes a map[string]string, but advisories
+				// only ever reach here via the db read path, which json-decodes them
+				// into Optional's map[string]any (a JSON object always decodes to
+				// map[string]any, never map[string]string) — so the map[string]any
+				// assertion is the only shape possible here. Fall back to the note
+				// title when the reference has no fetched title.
+				title := a.Content.Title
+				if m, ok := a.Content.Optional["reference_titles"].(map[string]any); ok {
+					if t, ok := m[r.URL].(string); ok && t != "" {
+						title = t
+					}
+				}
+				alert := models.Alert{Team: "jpcert", URL: r.URL, Title: title}
+				if !slices.ContainsFunc(vi.AlertDict.JPCERT, func(e models.Alert) bool { return e.URL == alert.URL }) {
+					vi.AlertDict.JPCERT = append(vi.AlertDict.JPCERT, alert)
+				}
+			}
+
+			// Keep the postConvert-built entry (same JVNDB link) for JVN-detected
+			// CVEs; otherwise add a bare source-link pointer. This also de-duplicates
+			// across the two JVN feeds (enrichJVN runs once per feed).
+			if slices.ContainsFunc(vi.CveContents[models.Jvn], func(e models.CveContent) bool { return e.SourceLink == sourceLink }) {
+				continue
+			}
+			vi.CveContents[models.Jvn] = append(vi.CveContents[models.Jvn], models.CveContent{
+				Type:       models.Jvn,
+				CveID:      vi.CveID,
+				SourceLink: sourceLink,
+			})
+		}
+	}
+}
+
+// enrichEuvd adds ENISA EUVD (European Union Vulnerability Database) data as CveContent.
+// The EUVD record is stored in advisory content keyed by the EUVD root ID (e.g. EUVD-2025-0001),
+// and is associated with a CVE through the EUVD entry's vulnerability aliases.
+func enrichEuvd(vi *models.VulnInfo, rootMap map[dataTypes.RootID][]advisoryTypes.Advisory) {
+	if len(vi.CveContents[models.Euvd]) > 0 {
+		return
+	}
+	for rootID, advisories := range rootMap {
+		for _, a := range advisories {
+			// The canonical EUVD record is the advisory whose ID matches the EUVD root ID.
+			// Other advisories under the same root are alias references (GHSA/PYSEC/MAL) without content.
+			if string(a.Content.ID) != string(rootID) {
+				continue
+			}
+
+			cvss2, cvss3, cvss40 := enrichCvss(a.Content.Severity)
+
+			var rs models.References
+			for _, r := range a.Content.References {
+				rs = append(rs, toReference(r.URL))
+			}
+
+			vi.CveContents[models.Euvd] = append(vi.CveContents[models.Euvd], models.CveContent{
+				Type:           models.Euvd,
+				CveID:          vi.CveID,
+				Title:          string(a.Content.ID),
+				Summary:        a.Content.Description,
+				Cvss2Score:     cvss2.BaseScore,
+				Cvss2Vector:    cvss2.Vector,
+				Cvss2Severity:  cvss2.NVDBaseSeverity,
+				Cvss3Score:     cvss3.BaseScore,
+				Cvss3Vector:    cvss3.Vector,
+				Cvss3Severity:  cvss3.BaseSeverity,
+				Cvss40Score:    cvss40.Score,
+				Cvss40Vector:   cvss40.Vector,
+				Cvss40Severity: cvss40.Severity,
+				SourceLink:     fmt.Sprintf("https://euvd.enisa.europa.eu/vulnerability/%s", a.Content.ID),
+				References:     rs,
+				Published: func() time.Time {
+					if a.Content.Published != nil {
+						return *a.Content.Published
+					}
+					return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+				}(),
+				LastModified: func() time.Time {
+					if a.Content.Modified != nil {
+						return *a.Content.Modified
+					}
+					return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+				}(),
+			})
+		}
+	}
+}
+
+// enrichMetasploit adds Metasploit module data to VulnInfo.
+func enrichMetasploit(vi *models.VulnInfo, rootMap map[dataTypes.RootID][]vulnerabilityTypes.Vulnerability) {
+	if len(vi.Metasploits) > 0 {
+		return
+	}
+	for _, vulns := range rootMap {
+		for _, v := range vulns {
+			for _, m := range v.Content.Metasploit {
+				var urls []string
+				for _, r := range m.References {
+					urls = append(urls, r.URL)
+				}
+				vi.Metasploits = append(vi.Metasploits, models.Metasploit{
+					Name:        m.FullName,
+					Title:       m.Name,
+					Description: m.Description,
+					URLs:        urls,
+				})
+			}
+		}
+	}
+}
+
+// enrichRedHatCVE adds RedHat CVE data as CveContent.
+func enrichRedHatCVE(vi *models.VulnInfo, rootMap map[dataTypes.RootID][]vulnerabilityTypes.Vulnerability) {
+	if _, ok := vi.CveContents[models.RedHatAPI]; ok {
+		return
+	}
+	for rootID, vulns := range rootMap {
+		for _, v := range vulns {
+			cvss2, cvss3, cvss40 := enrichCvss(v.Content.Severity)
+
+			var rs models.References
+			for _, r := range v.Content.References {
+				rs = append(rs, toReference(r.URL))
+			}
+
+			sourceLink := cveContentSourceLink(models.RedHatAPI, v, rootID)
+			for _, m := range v.Content.Mitigations {
+				if m.Description == "" {
+					continue
+				}
+				vi.Mitigations = append(vi.Mitigations, models.Mitigation{
+					CveContentType: models.RedHatAPI,
+					Mitigation:     m.Description,
+					URL:            sourceLink,
+				})
+			}
+
+			vi.CveContents[models.RedHatAPI] = append(vi.CveContents[models.RedHatAPI], models.CveContent{
+				Type:           models.RedHatAPI,
+				CveID:          string(v.Content.ID),
+				Title:          v.Content.Title,
+				Summary:        v.Content.Description,
+				Cvss2Score:     cvss2.BaseScore,
+				Cvss2Vector:    cvss2.Vector,
+				Cvss2Severity:  cvss2.NVDBaseSeverity,
+				Cvss3Score:     cvss3.BaseScore,
+				Cvss3Vector:    cvss3.Vector,
+				Cvss3Severity:  cvss3.BaseSeverity,
+				Cvss40Score:    cvss40.Score,
+				Cvss40Vector:   cvss40.Vector,
+				Cvss40Severity: cvss40.Severity,
+				SourceLink:     sourceLink,
+				References:     rs,
+				CweIDs: func() []string {
+					var cs []string //nolint:prealloc
+					for _, cwe := range v.Content.CWE {
+						cs = append(cs, cwe.CWE...)
+					}
+					return cs
+				}(),
+				Published: func() time.Time {
+					if v.Content.Published != nil {
+						return *v.Content.Published
+					}
+					return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+				}(),
+				LastModified: func() time.Time {
+					if v.Content.Modified != nil {
+						return *v.Content.Modified
+					}
+					return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+				}(),
+			})
+		}
+	}
+}
+
+// enrichNVD adds NVD data as CveContent, one entry per CVSS/CWE source (see
+// splitCveContentBySource) so the CNA's metrics and NVD's own analysis are
+// reported separately. It mirrors the NVD branch of the CPE detection path (see
+// postConvert) so a CVE detected by another source carries the same nvd
+// CveContents — plus NVD exploits/mitigations — that an NVD-detected CVE gets.
+// When the NVD CPE detection already filled those CveContents, the
+// content/exploits/mitigations are left in place; US-CERT alerts are still
+// derived here either way, since the detection path does not populate AlertDict.
+func enrichNVD(vi *models.VulnInfo, rootMap map[dataTypes.RootID][]vulnerabilityTypes.Vulnerability) {
+	_, hasContent := vi.CveContents[models.Nvd]
+	for rootID, vulns := range rootMap {
+		for _, v := range vulns {
+			// US-CERT alerts: an NVD reference whose URL contains "us-cert"
+			// (mirrors go-cve-dictionary's NvdCert derivation). Done regardless
+			// of hasContent — the CPE detection path fills nvd CveContent but
+			// not AlertDict, so this is the single place US-CERT is produced.
+			for _, r := range v.Content.References {
+				if !strings.HasPrefix(r.URL, "http") || !strings.Contains(r.URL, "us-cert") {
+					continue
+				}
+				ss := strings.Split(r.URL, "/")
+				alert := models.Alert{
+					Team:  "uscert",
+					URL:   r.URL,
+					Title: fmt.Sprintf("US-CERT-%s", ss[len(ss)-1]),
+				}
+				if !slices.ContainsFunc(vi.AlertDict.USCERT, func(e models.Alert) bool { return e.URL == alert.URL }) {
+					vi.AlertDict.USCERT = append(vi.AlertDict.USCERT, alert)
+				}
+			}
+
+			if hasContent {
+				continue
+			}
+
+			rs := func() models.References {
+				if len(v.Content.References) == 0 {
+					return nil
+				}
+				rs := make(models.References, 0, len(v.Content.References))
+				for _, r := range v.Content.References {
+					rs = append(rs, toReference(r.URL))
+				}
+				return rs
+			}()
+
+			for _, e := range v.Content.Exploit {
+				if e.Link == "" {
+					continue
+				}
+				vi.Exploits.AppendIfMissing(models.Exploit{
+					ExploitType: models.ExploitTypeNVD,
+					URL:         e.Link,
+				})
+			}
+			for _, m := range v.Content.Mitigations {
+				if m.Description == "" {
+					continue
+				}
+				vi.Mitigations.AppendIfMissing(models.Mitigation{
+					CveContentType: models.Nvd,
+					URL:            m.Description,
+				})
+			}
+
+			vi.CveContents[models.Nvd] = append(vi.CveContents[models.Nvd], splitCveContentBySource(models.CveContent{
+				Type:       models.Nvd,
+				CveID:      string(v.Content.ID),
+				Title:      v.Content.Title,
+				Summary:    v.Content.Description,
+				SourceLink: cveContentSourceLink(models.Nvd, v, rootID),
+				References: rs,
+				Published: func() time.Time {
+					if v.Content.Published != nil {
+						return *v.Content.Published
+					}
+					return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+				}(),
+				LastModified: func() time.Time {
+					if v.Content.Modified != nil {
+						return *v.Content.Modified
+					}
+					return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+				}(),
+			}, v.Content.Severity, v.Content.CWE, enrichCvss)...)
+		}
+	}
+}
+
+// enrichVulnCheck adds VulnCheck NVD++ (vulncheck-nist-nvd2) data as CveContent
+// under the models.Vulncheck source. VulnCheck mirrors and enriches NVD, so the
+// content (description, CVSS, CWE, references) parallels enrichNVD's, including
+// the one-entry-per-CVSS/CWE-source split (see splitCveContentBySource).
+//
+// The CPE detection path already builds a Vulncheck CveContent for every CVE it
+// detects through VulnCheck's vcVulnerableCPEs; the early return when a
+// Vulncheck content already exists keeps this enrich pass from duplicating
+// those, while still filling Vulncheck content for CVEs detected by other means
+// (e.g. OS packages). This mirrors go-cve-dictionary, whose VulnCheck content
+// was filled for any scanned CVE regardless of which source detected it and
+// independently of the NVD/Fortinet/Cisco/PaloAlto detection suppression (which
+// only governs whether VulnCheck is a detection basis, not its content).
+func enrichVulnCheck(vi *models.VulnInfo, rootMap map[dataTypes.RootID][]vulnerabilityTypes.Vulnerability) {
+	if _, ok := vi.CveContents[models.Vulncheck]; ok {
+		return
+	}
+	for rootID, vulns := range rootMap {
+		for _, v := range vulns {
+			var rs models.References
+			for _, r := range v.Content.References {
+				rs = append(rs, toReference(r.URL))
+			}
+
+			vi.CveContents[models.Vulncheck] = append(vi.CveContents[models.Vulncheck], splitCveContentBySource(models.CveContent{
+				Type:       models.Vulncheck,
+				CveID:      string(v.Content.ID),
+				Title:      v.Content.Title,
+				Summary:    v.Content.Description,
+				SourceLink: cveContentSourceLink(models.Vulncheck, v, rootID),
+				References: rs,
+				Published: func() time.Time {
+					if v.Content.Published != nil {
+						return *v.Content.Published
+					}
+					return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+				}(),
+				LastModified: func() time.Time {
+					if v.Content.Modified != nil {
+						return *v.Content.Modified
+					}
+					return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+				}(),
+			}, v.Content.Severity, v.Content.CWE, enrichCvss)...)
+		}
+	}
+}
+
+// enrichMitreCVE adds MITRE CVE v5 data as CveContent, one entry per CNA/ADP
+// source so each source's CVSS, CWE, references, and SSVC decision point are
+// reported separately (rendered as mitre(<source>) by CveContents.SSVC and the
+// reporter). The source is the CNA/ADP provider shortName (e.g. "CISA-ADP").
+func enrichMitreCVE(vi *models.VulnInfo, rootMap map[dataTypes.RootID][]vulnerabilityTypes.Vulnerability) {
+	if _, ok := vi.CveContents[models.Mitre]; ok {
+		return
+	}
+
+	// mitreBySource accumulates the per-source MITRE fields so each CNA/ADP
+	// source becomes its own CveContent.
+	type mitreBySource struct {
+		severities []severityTypes.Severity
+		references models.References
+		cweIDs     []string
+		ssvc       *models.SSVC
+	}
+
+	for rootID, vulns := range rootMap {
+		for _, v := range vulns {
+			// Group every per-source field by its CNA/ADP source in a single pass.
+			bySource := map[string]*mitreBySource{}
+			get := func(source string) *mitreBySource {
+				b, ok := bySource[source]
+				if !ok {
+					b = &mitreBySource{}
+					bySource[source] = b
+				}
+				return b
+			}
+			for _, s := range v.Content.Severity {
+				b := get(s.Source)
+				b.severities = append(b.severities, s)
+			}
+			for _, r := range v.Content.References {
+				b := get(r.Source)
+				b.references = append(b.references, toReference(r.URL))
+			}
+			for _, c := range v.Content.CWE {
+				b := get(c.Source)
+				b.cweIDs = append(b.cweIDs, c.CWE...)
+			}
+			for _, s := range v.Content.SSVC {
+				if b := get(s.Source); b.ssvc == nil {
+					b.ssvc = mitreSSVC(s)
+				}
+			}
+
+			// container_types maps each source label to its container role
+			// ("CNA"/"ADP"), set by the extractor from structural position.
+			containerTypes := mitreContainerTypes(v.Content.Optional)
+
+			sourceLink := cveContentSourceLink(models.Mitre, v, rootID)
+			published := func() time.Time {
+				if v.Content.Published != nil {
+					return *v.Content.Published
+				}
+				return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+			}()
+			lastModified := func() time.Time {
+				if v.Content.Modified != nil {
+					return *v.Content.Modified
+				}
+				return time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)
+			}()
+
+			// Order is normalised downstream by CveContents.Sort (see
+			// ScanResult.SortForJSONOutput), so emit in map order here.
+			for source, b := range bySource {
+				cvss2, cvss3, cvss40 := enrichCvss(b.severities)
+
+				cc := models.CveContent{
+					Type:           models.Mitre,
+					CveID:          string(v.Content.ID),
+					Title:          v.Content.Title,
+					Summary:        v.Content.Description,
+					Cvss2Score:     cvss2.BaseScore,
+					Cvss2Vector:    cvss2.Vector,
+					Cvss2Severity:  cvss2.NVDBaseSeverity,
+					Cvss3Score:     cvss3.BaseScore,
+					Cvss3Vector:    cvss3.Vector,
+					Cvss3Severity:  cvss3.BaseSeverity,
+					Cvss40Score:    cvss40.Score,
+					Cvss40Vector:   cvss40.Vector,
+					Cvss40Severity: cvss40.Severity,
+					SourceLink:     sourceLink,
+					References:     b.references,
+					CweIDs:         b.cweIDs,
+					Published:      published,
+					LastModified:   lastModified,
+					SSVC:           b.ssvc,
+				}
+				if source != "" {
+					// Qualify the source with its CNA/ADP role when known
+					// (e.g. "ADP:CISA-ADP"), so reports distinguish the two.
+					label := source
+					if ct := containerTypes[source]; ct != "" {
+						label = fmt.Sprintf("%s:%s", ct, source)
+					}
+					cc.Optional = map[string]string{"source": label}
+				}
+				vi.CveContents[models.Mitre] = append(vi.CveContents[models.Mitre], cc)
+			}
+		}
+	}
+}
+
+// mitreContainerTypes extracts the source-label -> container role ("CNA"/"ADP")
+// mapping that the MITRE CVE v5 extractor stores under Optional["container_types"].
+// Returns an empty (non-nil) map when absent or malformed.
+func mitreContainerTypes(optional map[string]any) map[string]string {
+	cts := map[string]string{}
+	m, ok := optional["container_types"].(map[string]any)
+	if !ok {
+		return cts
+	}
+	for source, ct := range m {
+		if s, ok := ct.(string); ok {
+			cts[source] = s
+		}
+	}
+	return cts
+}
+
+// mitreSSVC maps a single SSVC decision point to models.SSVC. The option keys
+// follow the SSVC computed schema ("Exploitation", "Automatable",
+// "Technical Impact").
+func mitreSSVC(s ssvcTypes.SSVC) *models.SSVC {
+	ssvc := &models.SSVC{}
+	for _, o := range s.Options {
+		switch o.Key {
+		case "Exploitation":
+			ssvc.Exploitation = o.Value
+		case "Automatable":
+			ssvc.Automatable = o.Value
+		case "Technical Impact":
+			ssvc.TechnicalImpact = o.Value
+		}
+	}
+	return ssvc
+}
+
+// enrichVulnerabilityKEV extracts KEV data from vulnerability content and maps it to models.KEV.
+// Handles CISA and VulnCheck KEV sources where KEV data is stored in vulnerability content.
+func enrichVulnerabilityKEV(sourceID sourceTypes.SourceID, rootMap map[dataTypes.RootID][]vulnerabilityTypes.Vulnerability) []models.KEV {
+	var kevType models.KEVType
+	switch sourceID {
+	case sourceTypes.CISAKEV:
+		kevType = models.CISAKEVType
+	case sourceTypes.VulnCheckKEV:
+		kevType = models.VulnCheckKEVType
+	default:
+		return nil
+	}
+
+	var kevs []models.KEV
+	for _, vulns := range rootMap {
+		for _, v := range vulns {
+			if v.Content.KEV == nil {
+				continue
+			}
+
+			k := models.KEV{
+				Type:                       kevType,
+				VendorProject:              v.Content.KEV.VendorProject,
+				Product:                    v.Content.KEV.Product,
+				VulnerabilityName:          string(v.Content.Title),
+				ShortDescription:           v.Content.Description,
+				RequiredAction:             v.Content.KEV.RequiredAction,
+				KnownRansomwareCampaignUse: v.Content.KEV.KnownRansomwareCampaignUse,
+				DateAdded:                  v.Content.KEV.DateAdded,
+				DueDate: func() *time.Time {
+					if v.Content.KEV.DueDate.Equal(time.Date(1000, time.January, 1, 0, 0, 0, 0, time.UTC)) || v.Content.KEV.DueDate.IsZero() {
+						return nil
+					}
+					return new(v.Content.KEV.DueDate)
+				}(),
+			}
+
+			switch sourceID {
+			case sourceTypes.CISAKEV:
+				k.CISA = &models.CISAKEV{
+					Note: v.Content.KEV.Notes,
+				}
+			case sourceTypes.VulnCheckKEV:
+				if v.Content.KEV.VulnCheck != nil {
+					k.VulnCheck = &models.VulnCheckKEV{
+						XDB: func() []models.VulnCheckXDB {
+							if len(v.Content.KEV.VulnCheck.XDB) == 0 {
+								return nil
+							}
+							xs := make([]models.VulnCheckXDB, 0, len(v.Content.KEV.VulnCheck.XDB))
+							for _, x := range v.Content.KEV.VulnCheck.XDB {
+								xs = append(xs, models.VulnCheckXDB{
+									XDBID:       x.XDBID,
+									XDBURL:      x.XDBURL,
+									DateAdded:   x.DateAdded,
+									ExploitType: x.ExploitType,
+									CloneSSHURL: x.CloneSSHURL,
+								})
+							}
+							return xs
+						}(),
+						ReportedExploitation: func() []models.VulnCheckReportedExploitation {
+							if len(v.Content.KEV.VulnCheck.ReportedExploitation) == 0 {
+								return nil
+							}
+							es := make([]models.VulnCheckReportedExploitation, 0, len(v.Content.KEV.VulnCheck.ReportedExploitation))
+							for _, e := range v.Content.KEV.VulnCheck.ReportedExploitation {
+								es = append(es, models.VulnCheckReportedExploitation{
+									URL:       e.URL,
+									DateAdded: e.DateAdded,
+								})
+							}
+							return es
+						}(),
+					}
+				}
+			}
+
+			kevs = append(kevs, k)
+		}
+	}
+	return kevs
+}
+
+// enrichAdvisoryKEV extracts KEV data from advisory content.
+// Handles ENISA KEV where KEV data is stored in advisory content rather than vulnerability content.
+func enrichAdvisoryKEV(rootMap map[dataTypes.RootID][]advisoryTypes.Advisory) []models.KEV {
+	var kevs []models.KEV
+	for _, advisories := range rootMap {
+		for _, a := range advisories {
+			if a.Content.KEV == nil {
+				continue
+			}
+
+			k := models.KEV{
+				Type:          models.ENISAKEVType,
+				VendorProject: a.Content.KEV.VendorProject,
+				Product:       a.Content.KEV.Product,
+			}
+
+			if a.Content.KEV.ENISA != nil {
+				k.ENISA = &models.ENISAKEV{
+					DateReported:           a.Content.KEV.ENISA.DateReported,
+					PatchedSince:           a.Content.KEV.ENISA.PatchedSince,
+					OriginSource:           a.Content.KEV.ENISA.OriginSource,
+					ExploitationType:       a.Content.KEV.ENISA.ExploitationType,
+					ThreatActorsExploiting: a.Content.KEV.ENISA.ThreatActorsExploiting,
+				}
+			}
+
+			kevs = append(kevs, k)
+		}
+	}
+	return kevs
+}
+
+// enrichExploits converts vulnerability exploit data to models.Exploit slice.
+func enrichExploits(sourceID sourceTypes.SourceID, rootMap map[dataTypes.RootID][]vulnerabilityTypes.Vulnerability) []models.Exploit {
+	var exploits []models.Exploit
+	for _, vulns := range rootMap {
+		for _, v := range vulns {
+			for _, e := range v.Content.Exploit {
+				exploit := models.Exploit{
+					URL:         e.Link,
+					Description: e.Description,
+				}
+				switch sourceID {
+				case sourceTypes.ExploitExploitDB:
+					exploit.ExploitType = models.ExploitTypeExploitDB
+					if e.ExploitDB != nil {
+						exploit.ID = e.ExploitDB.ID
+						exploit.Verified = &e.ExploitDB.Verified
+						if e.ExploitDB.RawURL != "" {
+							exploit.DocumentURL = &e.ExploitDB.RawURL
+						}
+					}
+				case sourceTypes.ExploitGitHub:
+					exploit.ExploitType = models.ExploitTypeGitHub
+				case sourceTypes.ExploitInTheWild:
+					exploit.ExploitType = models.ExploitTypeInTheWild
+				case sourceTypes.ExploitTrickest:
+					exploit.ExploitType = models.ExploitTypeTrickest
+				case sourceTypes.NucleiRepository:
+					exploit.ExploitType = models.ExploitTypeNuclei
+					if e.Nuclei != nil {
+						exploit.Verified = &e.Nuclei.Verified
+					}
+				default:
+					exploit.ExploitType = models.ExploitType(sourceID)
+				}
+				exploits = append(exploits, exploit)
+			}
+		}
+	}
+	return exploits
+}
+
+// MacOSCPEs synthesises the Apple CPEs for a macOS scan result: the OS
+// (from r.Release) and each installed application bundle (from r.Packages,
+// keyed by CFBundleIdentifier). macOS has no package security database, so the
+// caller detects these through the CPE path (DetectCPEs). They carry
+// UseJVN:false — Apple CPEs do not consult JVN, mirroring the former
+// go-cve-dictionary macOS handling.
+func MacOSCPEs(r *models.ScanResult) []CPE {
+	var targets []string
+	switch r.Family {
+	case constant.MacOSX:
+		targets = []string{"mac_os_x"}
+	case constant.MacOSXServer:
+		targets = []string{"mac_os_x_server"}
+	case constant.MacOS:
+		targets = []string{"macos", "mac_os"}
+	case constant.MacOSServer:
+		targets = []string{"macos_server", "mac_os_server"}
+	default:
+		return nil
+	}
+
+	var cpes []CPE
+	// The OS itself is bound to its version, so its CPE needs the release.
+	// Applications bind to the OS target (e.g. mac_os_x), not its version, so
+	// they stay detectable even without the release.
+	if r.Release != "" {
+		for _, t := range targets {
+			cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/o:apple:%s:%s", t, r.Release)})
+		}
+	}
+
+	for _, p := range r.Packages {
+		if p.Version == "" {
+			continue
+		}
+		switch p.Repository {
+		case "com.apple.Safari":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:safari:%s::~~~%s~~", p.Version, t)})
+			}
+		case "com.apple.Music":
+			for _, t := range targets {
+				cpes = append(cpes,
+					CPE{URI: fmt.Sprintf("cpe:/a:apple:music:%s::~~~%s~~", p.Version, t)},
+					CPE{URI: fmt.Sprintf("cpe:/a:apple:apple_music:%s::~~~%s~~", p.Version, t)},
+				)
+			}
+		case "com.apple.mail":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:mail:%s::~~~%s~~", p.Version, t)})
+			}
+		case "com.apple.Terminal":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:terminal:%s::~~~%s~~", p.Version, t)})
+			}
+		case "com.apple.shortcuts":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:shortcuts:%s::~~~%s~~", p.Version, t)})
+			}
+		case "com.apple.iCal":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:ical:%s::~~~%s~~", p.Version, t)})
+			}
+		case "com.apple.iWork.Keynote":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:keynote:%s::~~~%s~~", p.Version, t)})
+			}
+		case "com.apple.iWork.Numbers":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:numbers:%s::~~~%s~~", p.Version, t)})
+			}
+		case "com.apple.iWork.Pages":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:pages:%s::~~~%s~~", p.Version, t)})
+			}
+		case "com.apple.dt.Xcode":
+			for _, t := range targets {
+				cpes = append(cpes, CPE{URI: fmt.Sprintf("cpe:/a:apple:xcode:%s::~~~%s~~", p.Version, t)})
+			}
+		}
+	}
+
+	return cpes
+}

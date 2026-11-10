@@ -16,11 +16,12 @@ type SlackConf struct {
 	AuthUser    string   `json:"-" toml:"authUser,omitempty"`
 	NotifyUsers []string `toml:"notifyUsers,omitempty" json:"-"`
 	Text        string   `json:"-"`
+	Enabled     bool     `toml:"-" json:"-"`
 }
 
 // Validate validates configuration
 func (c *SlackConf) Validate() (errs []error) {
-	if !Conf.ToSlack {
+	if !c.Enabled {
 		return
 	}
 
@@ -31,10 +32,8 @@ func (c *SlackConf) Validate() (errs []error) {
 	if len(c.Channel) == 0 {
 		errs = append(errs, xerrors.New("slack.channel must not be empty"))
 	} else {
-		if !(strings.HasPrefix(c.Channel, "#") ||
-			c.Channel == "${servername}") {
-			errs = append(errs, xerrors.Errorf(
-				"channel's prefix must be '#', channel: %s", c.Channel))
+		if !strings.HasPrefix(c.Channel, "#") && c.Channel != "${servername}" {
+			errs = append(errs, xerrors.Errorf("channel's prefix must be '#', channel: %s", c.Channel))
 		}
 	}
 

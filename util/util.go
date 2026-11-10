@@ -5,21 +5,22 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 
 	"github.com/future-architect/vuls/config"
+	"github.com/future-architect/vuls/logging"
 )
 
 // GenWorkers generates goroutine
 // http://qiita.com/na-o-ys/items/65373132b1c5bc973cca
 func GenWorkers(num int) chan<- func() {
 	tasks := make(chan func())
-	for i := 0; i < num; i++ {
+	for range num {
 		go func() {
 			defer func() {
 				if p := recover(); p != nil {
-					log := NewCustomLogger(config.ServerInfo{})
-					log.Errorf("run time panic: %v", p)
+					logging.Log.Errorf("run time panic: %+v", p)
 				}
 			}()
 			for f := range tasks {
@@ -32,10 +33,8 @@ func GenWorkers(num int) chan<- func() {
 
 // AppendIfMissing append to the slice if missing
 func AppendIfMissing(slice []string, s string) []string {
-	for _, ele := range slice {
-		if ele == s {
-			return slice
-		}
+	if slices.Contains(slice, s) {
+		return slice
 	}
 	return append(slice, s)
 }
@@ -110,9 +109,17 @@ func IP() (ipv4Addrs []string, ipv6Addrs []string, err error) {
 	return ipv4Addrs, ipv6Addrs, nil
 }
 
-// ProxyEnv returns shell environment variables to set proxy
-func ProxyEnv() string {
-	httpProxyEnv := ""
+// PrependProxyEnv prepends proxy environment variable
+func PrependProxyEnv(cmd string) string {
+	if config.Conf.HTTPProxy == "" {
+		return cmd
+	}
+	return fmt.Sprintf("%s %s", proxyEnv(), cmd)
+}
+
+// proxyEnv returns shell environment variables to set proxy
+func proxyEnv() string {
+	var httpProxyEnv strings.Builder
 	keys := []string{
 		"http_proxy",
 		"https_proxy",
@@ -120,18 +127,9 @@ func ProxyEnv() string {
 		"HTTPS_PROXY",
 	}
 	for _, key := range keys {
-		httpProxyEnv += fmt.Sprintf(
-			` %s="%s"`, key, config.Conf.HTTPProxy)
+		fmt.Fprintf(&httpProxyEnv, ` %s="%s"`, key, config.Conf.HTTPProxy)
 	}
-	return httpProxyEnv
-}
-
-// PrependProxyEnv prepends proxy environment variable
-func PrependProxyEnv(cmd string) string {
-	if config.Conf.HTTPProxy == "" {
-		return cmd
-	}
-	return fmt.Sprintf("%s %s", ProxyEnv(), cmd)
+	return httpProxyEnv.String()
 }
 
 //  func unixtime(s string) (time.Time, error) {
@@ -177,7 +175,7 @@ func Major(version string) string {
 	} else {
 		ver = ss[1]
 	}
-	return ver[0:strings.Index(ver, ".")]
+	return strings.Split(ver, ".")[0]
 }
 
 // GetHTTPClient return http.Client

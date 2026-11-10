@@ -7,14 +7,17 @@ import (
 
 // SMTPConf is smtp config
 type SMTPConf struct {
-	SMTPAddr      string   `toml:"smtpAddr,omitempty" json:"-"`
-	SMTPPort      string   `toml:"smtpPort,omitempty" valid:"port" json:"-"`
-	User          string   `toml:"user,omitempty" json:"-"`
-	Password      string   `toml:"password,omitempty" json:"-"`
-	From          string   `toml:"from,omitempty" json:"-"`
-	To            []string `toml:"to,omitempty" json:"-"`
-	Cc            []string `toml:"cc,omitempty" json:"-"`
-	SubjectPrefix string   `toml:"subjectPrefix,omitempty" json:"-"`
+	SMTPAddr              string   `toml:"smtpAddr,omitempty" json:"-"`
+	SMTPPort              string   `toml:"smtpPort,omitempty" valid:"port" json:"-"`
+	TLSMode               string   `toml:"tlsMode,omitempty" json:"-"`
+	TLSInsecureSkipVerify bool     `toml:"tlsInsecureSkipVerify,omitempty" json:"-"`
+	User                  string   `toml:"user,omitempty" json:"-"`
+	Password              string   `toml:"password,omitempty" json:"-"`
+	From                  string   `toml:"from,omitempty" json:"-"`
+	To                    []string `toml:"to,omitempty" json:"-"`
+	Cc                    []string `toml:"cc,omitempty" json:"-"`
+	SubjectPrefix         string   `toml:"subjectPrefix,omitempty" json:"-"`
+	Enabled               bool     `toml:"-" json:"-"`
 }
 
 func checkEmails(emails []string) (errs []error) {
@@ -31,11 +34,10 @@ func checkEmails(emails []string) (errs []error) {
 
 // Validate SMTP configuration
 func (c *SMTPConf) Validate() (errs []error) {
-	if !Conf.ToEmail {
+	if !c.Enabled {
 		return
 	}
-	// Check Emails fromat
-	emails := []string{}
+	emails := make([]string, 0, 1+len(c.To)+len(c.Cc))
 	emails = append(emails, c.From)
 	emails = append(emails, c.To...)
 	emails = append(emails, c.Cc...)
@@ -44,11 +46,16 @@ func (c *SMTPConf) Validate() (errs []error) {
 		errs = append(errs, emailErrs...)
 	}
 
-	if len(c.SMTPAddr) == 0 {
+	if c.SMTPAddr == "" {
 		errs = append(errs, xerrors.New("email.smtpAddr must not be empty"))
 	}
-	if len(c.SMTPPort) == 0 {
+	if c.SMTPPort == "" {
 		errs = append(errs, xerrors.New("email.smtpPort must not be empty"))
+	}
+	switch c.TLSMode {
+	case "", "None", "STARTTLS", "SMTPS":
+	default:
+		errs = append(errs, xerrors.New(`email.tlsMode accepts ["", "None", "STARTTLS", "SMTPS"]`))
 	}
 	if len(c.To) == 0 {
 		errs = append(errs, xerrors.New("email.To required at least one address"))

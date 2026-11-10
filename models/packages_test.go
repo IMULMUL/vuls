@@ -1,10 +1,14 @@
 package models
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/k0kubun/pp"
+
+	"github.com/future-architect/vuls/constant"
 )
 
 func TestMergeNewVersion(t *testing.T) {
@@ -298,6 +302,41 @@ func TestPackage_FormatVersionFromTo(t *testing.T) {
 	}
 }
 
+func TestPackage_RepositoryClassOmitEmpty(t *testing.T) {
+	tests := []struct {
+		name            string
+		repositoryClass string
+		wantKey         bool
+	}{
+		{
+			name:            "unset packages keep the previous JSON",
+			repositoryClass: "",
+			wantKey:         false,
+		},
+		{
+			name:            "official",
+			repositoryClass: "official",
+			wantKey:         true,
+		},
+		{
+			name:            "third-party",
+			repositoryClass: "third-party",
+			wantKey:         true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bs, err := json.Marshal(Package{Name: "bash", RepositoryClass: tt.repositoryClass})
+			if err != nil {
+				t.Fatalf("json.Marshal() error = %v", err)
+			}
+			if got := strings.Contains(string(bs), `"repositoryClass"`); got != tt.wantKey {
+				t.Errorf("json.Marshal() = %s, has repositoryClass = %v, want %v", bs, got, tt.wantKey)
+			}
+		})
+	}
+}
+
 func Test_IsRaspbianPackage(t *testing.T) {
 	type args struct {
 		name string
@@ -382,7 +421,7 @@ func Test_IsRaspbianPackage(t *testing.T) {
 	}
 }
 
-func Test_parseListenPorts(t *testing.T) {
+func Test_NewPortStat(t *testing.T) {
 	tests := []struct {
 		name   string
 		args   string
@@ -423,7 +462,191 @@ func Test_parseListenPorts(t *testing.T) {
 			if err != nil {
 				t.Errorf("unexpected error occurred: %s", err)
 			} else if !reflect.DeepEqual(*listenPort, tt.expect) {
-				t.Errorf("base.parseListenPorts() = %v, want %v", *listenPort, tt.expect)
+				t.Errorf("base.NewPortStat() = %v, want %v", *listenPort, tt.expect)
+			}
+		})
+	}
+}
+
+func TestRenameKernelSourcePackageName(t *testing.T) {
+	type args struct {
+		family string
+		name   string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "debian linux-signed -> linux",
+			args: args{
+				family: constant.Debian,
+				name:   "linux-signed",
+			},
+			want: "linux",
+		},
+		{
+			name: "debian apt",
+			args: args{
+				family: constant.Debian,
+				name:   "apt",
+			},
+			want: "apt",
+		},
+		{
+			name: "ubuntu linux-meta -> linux",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "linux-meta",
+			},
+			want: "linux",
+		},
+		{
+			name: "ubuntu apt",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "apt",
+			},
+			want: "apt",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := RenameKernelSourcePackageName(tt.args.family, tt.args.name); got != tt.want {
+				t.Errorf("RenameKernelSourcePackageName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsKernelSourcePackage(t *testing.T) {
+	type args struct {
+		family string
+		name   string
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "debian apt",
+			args: args{
+				family: constant.Debian,
+				name:   "apt",
+			},
+			want: false,
+		},
+		{
+			name: "debian linux",
+			args: args{
+				family: constant.Debian,
+				name:   "linux",
+			},
+			want: true,
+		},
+		{
+			name: "debian linux",
+			args: args{
+				family: constant.Debian,
+				name:   "linux",
+			},
+			want: true,
+		},
+		{
+			name: "debian linux-5.10",
+			args: args{
+				family: constant.Debian,
+				name:   "linux-5.10",
+			},
+			want: true,
+		},
+		{
+			name: "debian linux-grsec",
+			args: args{
+				family: constant.Debian,
+				name:   "linux-grsec",
+			},
+			want: true,
+		},
+		{
+			name: "debian linux-base",
+			args: args{
+				family: constant.Debian,
+				name:   "linux-base",
+			},
+			want: false,
+		},
+		{
+			name: "ubuntu apt",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "apt",
+			},
+			want: false,
+		},
+		{
+			name: "ubuntu linux",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "linux",
+			},
+			want: true,
+		},
+		{
+			name: "ubuntu linux-aws",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "linux-aws",
+			},
+			want: true,
+		},
+		{
+			name: "ubuntu linux-5.9",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "linux-5.9",
+			},
+			want: true,
+		},
+		{
+			name: "ubuntu linux-base",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "linux-base",
+			},
+			want: false,
+		},
+		{
+			name: "ubuntu linux-aws-edge",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "linux-aws-edge",
+			},
+			want: true,
+		},
+		{
+			name: "ubuntu linux-aws-5.15",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "linux-aws-5.15",
+			},
+			want: true,
+		},
+		{
+			name: "ubuntu linux-lowlatency-hwe-5.15",
+			args: args{
+				family: constant.Ubuntu,
+				name:   "linux-lowlatency-hwe-5.15",
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsKernelSourcePackage(tt.args.family, tt.args.name); got != tt.want {
+				t.Errorf("IsKernelSourcePackage() = %v, want %v", got, tt.want)
 			}
 		})
 	}
